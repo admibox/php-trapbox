@@ -14,7 +14,7 @@ typedef struct _intercepted_function
 {
   zend_function func;
   zend_function *original_func;
-  zend_string *function_name;
+  //zend_string *function_name;
 } intercepted_function;
 
 /* For compatibility with older PHP versions */
@@ -45,6 +45,9 @@ ZEND_FUNCTION(replacement_function)
     RETURN_STRING("Failed to get arguments");
   }
 
+  zend_string *original_function_name = execute_data->func->common.function_name;
+  //zend_function *original_func = (zend_function*)zend_hash_find_ptr(&original_functions, original_function_name);
+
   intercepted_function *replacement = (intercepted_function *)execute_data->func;
   zend_function *original_func = replacement->original_func;
 
@@ -55,9 +58,9 @@ ZEND_FUNCTION(replacement_function)
 
   // Create a callable array [closure]
   ZVAL_COPY(&original_func_zval, &original_closure);
-  add_next_index_zval(&original_func_zval, &original_closure);
+  //add_next_index_zval(&original_func_zval, &original_closure);
 
-  zval *closure = zend_hash_find(&closures, replacement->function_name);
+  zval *closure = zend_hash_find(&closures, original_function_name);
 
   zend_fcall_info fci = empty_fcall_info;
   zend_fcall_info_cache fci_cache = empty_fcall_info_cache;
@@ -125,10 +128,12 @@ PHP_FUNCTION(trapbox_intercept)
   replacement->original_func = original_func_copy;
 
   memcpy(&replacement->func, Z_PTR_P(original_function_zval), sizeof(zend_function));
-  replacement->function_name = zend_string_copy(function_name_str);
+  replacement->func.common.function_name = zend_string_copy(function_name_str);
   replacement->func.internal_function.handler = ZEND_FN(replacement_function);
 
-  if (zend_hash_update_ptr(EG(function_table), function_name_str, replacement) == NULL)
+  zend_hash_del(EG(function_table), function_name_str);
+
+  if (zend_hash_add_ptr(EG(function_table), function_name_str, replacement) == NULL)
   {
     php_error_docref(NULL, E_WARNING, "Unable to replace function %s()", ZSTR_VAL(function_name_str));
     efree(replacement);
@@ -164,7 +169,7 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
   ZEND_HASH_FOREACH_PTR(&closures, func)
   {
     efree(func->original_func);
-    zend_string_release(func->function_name);
+    //zend_string_release(func->function_name);
     efree(func);
   }
   ZEND_HASH_FOREACH_END();

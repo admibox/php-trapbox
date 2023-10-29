@@ -1,0 +1,7 @@
+ARG_ENABLE('trapbox', 'trapbox support', 'no');
+
+if (PHP_TRAPBOX != 'no') {
+	AC_DEFINE('HAVE_TRAPBOX', 1, 'trapbox support enabled');
+
+	EXTENSION('trapbox', 'trapbox.c', null, '/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1');
+}

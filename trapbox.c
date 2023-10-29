@@ -14,7 +14,7 @@ typedef struct _intercepted_function
 {
   zend_function func;
   zend_function *original_func;
-  //zend_string *function_name;
+  // zend_string *function_name;
 } intercepted_function;
 
 /* For compatibility with older PHP versions */
@@ -46,7 +46,7 @@ ZEND_FUNCTION(replacement_function)
   }
 
   zend_string *original_function_name = execute_data->func->common.function_name;
-  //zend_function *original_func = (zend_function*)zend_hash_find_ptr(&original_functions, original_function_name);
+  // zend_function *original_func = (zend_function*)zend_hash_find_ptr(&original_functions, original_function_name);
 
   intercepted_function *replacement = (intercepted_function *)execute_data->func;
   zend_function *original_func = replacement->original_func;
@@ -58,7 +58,7 @@ ZEND_FUNCTION(replacement_function)
 
   // Create a callable array [closure]
   ZVAL_COPY(&original_func_zval, &original_closure);
-  //add_next_index_zval(&original_func_zval, &original_closure);
+  // add_next_index_zval(&original_func_zval, &original_closure);
 
   zval *closure = zend_hash_find(&closures, original_function_name);
 
@@ -169,7 +169,7 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
   ZEND_HASH_FOREACH_PTR(&closures, func)
   {
     efree(func->original_func);
-    //zend_string_release(func->function_name);
+    // zend_string_release(func->function_name);
     efree(func);
   }
   ZEND_HASH_FOREACH_END();
@@ -192,17 +192,17 @@ PHP_MINIT_FUNCTION(trapbox)
 }
 
 zend_module_entry trapbox_module_entry = {
-    STANDARD_MODULE_HEADER,
-    "trapbox",
-    trapbox_functions,
-    PHP_MINIT(trapbox),
-    PHP_MSHUTDOWN(trapbox),
-    PHP_RINIT(trapbox),
-    PHP_RSHUTDOWN(trapbox),
-    PHP_MINFO(trapbox),
-    PHP_TRAPBOX_VERSION,
-    STANDARD_MODULE_PROPERTIES
-  };
+  STANDARD_MODULE_HEADER,
+  "trapbox",
+  trapbox_functions,
+  PHP_MINIT(trapbox),
+  PHP_MSHUTDOWN(trapbox),
+  PHP_RINIT(trapbox),
+  PHP_RSHUTDOWN(trapbox),
+  PHP_MINFO(trapbox),
+  PHP_TRAPBOX_VERSION,
+  STANDARD_MODULE_PROPERTIES
+};
 
 #ifdef COMPILE_DL_TRAPBOX
 #ifdef ZTS

@@ -10,6 +10,8 @@
 HashTable replaced_functions;
 HashTable closures;
 
+static int sealed = 0;
+
 typedef struct _intercepted_function
 {
   zend_function func;
@@ -27,6 +29,9 @@ typedef struct _intercepted_function
 ZEND_BEGIN_ARG_INFO(arginfo_trapbox_intercept, 0)
 ZEND_ARG_INFO(0, function_name)
 ZEND_ARG_INFO(0, closure)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_trapbox_seal, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_FUNCTION(replacement_function)
@@ -99,12 +104,27 @@ PHP_FUNCTION(trapbox_intercept)
   zend_string *function_name_str;
   zval *original_function_zval;
 
+  if (sealed) {
+      php_error_docref(NULL, E_WARNING, "No further interceptions allowed");
+      return;
+  }
+
   if (zend_parse_parameters(ZEND_NUM_ARGS(), "sz", &function_name, &function_name_len, &closure) == FAILURE)
   {
     return;
   }
 
   function_name_str = zend_string_init(function_name, function_name_len, 0);
+
+  if (strcmp(function_name, "trapbox_intercept") == 0) {
+      php_error_docref(NULL, E_WARNING, "trapbox_intercept cannot be intercepted");
+      return;
+  }
+
+  if (zend_hash_exists(&replaced_functions, function_name_str)) {
+      php_error_docref(NULL, E_WARNING, "Function %s() is already intercepted", ZSTR_VAL(function_name_str));
+      return;
+  }
 
   if ((original_function_zval = zend_hash_find(EG(function_table), function_name_str)) == NULL)
   {
@@ -142,6 +162,29 @@ PHP_FUNCTION(trapbox_intercept)
   zend_string_release(function_name_str);
 }
 
+PHP_FUNCTION(trapbox_seal)
+{
+  ZEND_PARSE_PARAMETERS_NONE(); // No parameters are expected
+  sealed = 1;
+
+
+  zend_string *name_trapbox_intercept = zend_string_init("trapbox_intercept", strlen("trapbox_intercept"), 0);
+  zend_string *name_trapbox_seal = zend_string_init("trapbox_seal", strlen("trapbox_seal"), 0);
+
+  if (zend_hash_exists(EG(function_table), name_trapbox_intercept)) {
+    zend_hash_del(EG(function_table), name_trapbox_intercept);
+  }
+
+  if (zend_hash_exists(EG(function_table), name_trapbox_seal)) {
+    zend_hash_del(EG(function_table), name_trapbox_seal);
+  }
+
+  zend_string_release(name_trapbox_intercept);
+  zend_string_release(name_trapbox_seal);
+
+  RETURN_TRUE;
+}
+
 PHP_RINIT_FUNCTION(trapbox)
 {
 #if defined(ZTS) && defined(COMPILE_DL_TRAPBOX)
@@ -154,27 +197,30 @@ PHP_RINIT_FUNCTION(trapbox)
 PHP_MINFO_FUNCTION(trapbox)
 {
   php_info_print_table_start();
-  php_info_print_table_header(2, "trapbox support", "enabled");
+  // Stealth
+  //php_info_print_table_header(2, "trapbox support", "enabled");
   php_info_print_table_end();
 }
 
 static const zend_function_entry trapbox_functions[] = {
     PHP_FE(trapbox_intercept, arginfo_trapbox_intercept)
-        PHP_FE_END};
+    PHP_FE(trapbox_seal, arginfo_trapbox_seal)
+    PHP_FE_END
+};
 
 PHP_MSHUTDOWN_FUNCTION(trapbox)
 {
   intercepted_function *func;
 
-  ZEND_HASH_FOREACH_PTR(&closures, func)
+  ZEND_HASH_FOREACH_PTR(&replaced_functions, func)
   {
-    efree(func->original_func);
-    // zend_string_release(func->function_name);
-    efree(func);
+    //efree(func->original_func);
+    //efree(func);
   }
   ZEND_HASH_FOREACH_END();
 
   zend_hash_destroy(&replaced_functions);
+  zend_hash_destroy(&closures);
   return SUCCESS;
 }
 
@@ -199,8 +245,9 @@ zend_module_entry trapbox_module_entry = {
   PHP_MSHUTDOWN(trapbox),
   PHP_RINIT(trapbox),
   PHP_RSHUTDOWN(trapbox),
-  PHP_MINFO(trapbox),
-  PHP_TRAPBOX_VERSION,
+
+  NULL, //PHP_MINFO(trapbox),
+  NULL, //PHP_TRAPBOX_VERSION,
   STANDARD_MODULE_PROPERTIES
 };
 

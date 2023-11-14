@@ -12,6 +12,9 @@ HashTable closures;
 
 static int sealed = 0;
 
+// Thread-local storage for call context
+__thread int internal_call_context = 0;
+
 typedef struct _intercepted_function
 {
   zend_function func;
@@ -33,6 +36,18 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO(arginfo_trapbox_seal, 0)
 ZEND_END_ARG_INFO()
+
+
+// Utility functions to manage context
+void enter_internal_call() {
+    internal_call_context++;
+}
+
+void exit_internal_call() {
+    if (internal_call_context > 0) {
+        internal_call_context--;
+    }
+}
 
 ZEND_FUNCTION(replacement_function)
 {
@@ -56,39 +71,61 @@ ZEND_FUNCTION(replacement_function)
   intercepted_function *replacement = (intercepted_function *)execute_data->func;
   zend_function *original_func = replacement->original_func;
 
-  // Create an anonymous function (closure) that wraps around the original function
-  zval original_closure;
-  object_init_ex(&original_closure, zend_ce_closure);
-  zend_create_closure(&original_closure, original_func, NULL, NULL, NULL);
-
-  // Create a callable array [closure]
-  ZVAL_COPY(&original_func_zval, &original_closure);
-  // add_next_index_zval(&original_func_zval, &original_closure);
-
-  zval *closure = zend_hash_find(&closures, original_function_name);
-
   zend_fcall_info fci = empty_fcall_info;
   zend_fcall_info_cache fci_cache = empty_fcall_info_cache;
 
-  zend_fcall_info_init(closure, 0, &fci, &fci_cache, NULL, &error);
+    if (internal_call_context > 0) {
+        // Directly call the original function
 
-  fci.retval = &retval;
-  fci.param_count = num_args + 1; // Adding 1 for the original function callable
-  fci.params = safe_emalloc((num_args + 1), sizeof(zval), 0);
-  ZVAL_COPY_VALUE(&fci.params[0], &original_func_zval);
-  for (uint32_t i = 0; i < num_args; ++i)
-  {
-    ZVAL_COPY_VALUE(&fci.params[i + 1], &args[i]);
+      fci.size = sizeof(fci);
+      fci.retval = &retval;
+      fci.param_count = num_args;
+      fci.params = args;
+      fci_cache.function_handler = original_func;
+      fci_cache.called_scope = original_func->common.scope;
+      fci_cache.object = NULL;
+
+      if (zend_call_function(&fci, &fci_cache) == FAILURE) {
+          php_printf("Failed to call original function\n");
+          RETURN_FALSE;
+      }
+
+    } else {
+      // Create an anonymous function (closure) that wraps around the original function
+      zval original_closure;
+      object_init_ex(&original_closure, zend_ce_closure);
+      zend_create_closure(&original_closure, original_func, NULL, NULL, NULL);
+
+      // Create a callable array [closure]
+      ZVAL_COPY(&original_func_zval, &original_closure);
+      // add_next_index_zval(&original_func_zval, &original_closure);
+
+      zval *closure = zend_hash_find(&closures, original_function_name);
+
+      zend_fcall_info_init(closure, 0, &fci, &fci_cache, NULL, &error);
+
+      fci.retval = &retval;
+      fci.param_count = num_args + 1; // Adding 1 for the original function callable
+      fci.params = safe_emalloc((num_args + 1), sizeof(zval), 0);
+      ZVAL_COPY_VALUE(&fci.params[0], &original_func_zval);
+      for (uint32_t i = 0; i < num_args; ++i)
+      {
+        ZVAL_COPY_VALUE(&fci.params[i + 1], &args[i]);
+      }
+      fci.size = sizeof(fci);
+
+      enter_internal_call();
+      if (zend_call_function(&fci, &fci_cache) != SUCCESS)
+      {
+        exit_internal_call();
+        php_printf("DEBUG: zend_call_function failed\n");
+        RETURN_STRING("Closure call failed");
+      }
+      exit_internal_call();
+
+      zval_ptr_dtor(&original_func_zval);
   }
-  fci.size = sizeof(fci);
 
-  if (zend_call_function(&fci, &fci_cache) != SUCCESS)
-  {
-    php_printf("DEBUG: zend_call_function failed\n");
-    RETURN_STRING("Closure call failed");
-  }
-
-  zval_ptr_dtor(&original_func_zval);
   efree(args);
   efree(fci.params);
 

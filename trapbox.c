@@ -10,6 +10,8 @@
 HashTable replaced_functions;
 HashTable closures;
 
+static zval exit_handler;
+static int exit_handler_set = 0;
 static int sealed = 0;
 
 // Thread-local storage for call context
@@ -29,6 +31,10 @@ typedef struct _intercepted_function
   ZEND_PARSE_PARAMETERS_END()
 #endif
 
+ZEND_BEGIN_ARG_INFO(arginfo_trapbox_set_exit_handler, 0)
+    ZEND_ARG_CALLABLE_INFO(0, handler, 0) // Expect a callable as the argument
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO(arginfo_trapbox_intercept, 0)
 ZEND_ARG_INFO(0, function_name)
 ZEND_ARG_INFO(0, closure)
@@ -36,6 +42,40 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO(arginfo_trapbox_seal, 0)
 ZEND_END_ARG_INFO()
+
+
+
+
+int trapbox_exit_handler(zend_execute_data *execute_data) {
+    zval retval;
+    zval args[1]; // Argument to pass to the closure
+    zval *status = NULL;
+
+    if (EX_NUM_ARGS() > 0) {
+        status = ZEND_CALL_ARG(execute_data, 1);
+    }
+
+    if (exit_handler_set && Z_TYPE(exit_handler) == IS_OBJECT) {
+        // Call the configured closure
+        ZVAL_NULL(&retval);
+
+        ZVAL_COPY(&args[0], status ? status : &EG(uninitialized_zval));
+
+        if (call_user_function(EG(function_table), NULL, &exit_handler, &retval, 1, args) == FAILURE) {
+            php_printf("[Trapbox] Failed to invoke exit handler\n");
+        }
+
+        zval_ptr_dtor(&args[0]);
+        zval_ptr_dtor(&retval);
+    } else {
+        php_printf("[Trapbox] No handler set for exit\n");
+    }
+
+    // Prevent actual exit
+    return ZEND_USER_OPCODE_RETURN;
+}
+
+
 
 
 // Utility functions to manage context
@@ -222,6 +262,30 @@ PHP_FUNCTION(trapbox_seal)
   RETURN_TRUE;
 }
 
+
+PHP_FUNCTION(trapbox_set_exit_handler) {
+    zval *handler;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "z", &handler) == FAILURE) {
+        RETURN_FALSE;
+    }
+
+    if (!zend_is_callable(handler, 0, NULL)) {
+        php_error_docref(NULL, E_WARNING, "Provided argument is not callable");
+        RETURN_FALSE;
+    }
+
+    if (exit_handler_set) {
+        zval_ptr_dtor(&exit_handler);
+    }
+
+    ZVAL_COPY(&exit_handler, handler);
+    exit_handler_set = 1;
+
+    RETURN_TRUE;
+}
+
+
 PHP_RINIT_FUNCTION(trapbox)
 {
 #if defined(ZTS) && defined(COMPILE_DL_TRAPBOX)
@@ -242,6 +306,7 @@ PHP_MINFO_FUNCTION(trapbox)
 static const zend_function_entry trapbox_functions[] = {
     PHP_FE(trapbox_intercept, arginfo_trapbox_intercept)
     PHP_FE(trapbox_seal, arginfo_trapbox_seal)
+    PHP_FE(trapbox_set_exit_handler, arginfo_trapbox_set_exit_handler)
     PHP_FE_END
 };
 
@@ -270,6 +335,7 @@ PHP_MINIT_FUNCTION(trapbox)
 {
   zend_hash_init(&replaced_functions, 8, NULL, NULL, 1);
   zend_hash_init(&closures, 8, NULL, ZVAL_PTR_DTOR, 1);
+  zend_set_user_opcode_handler(ZEND_EXIT, trapbox_exit_handler);
 
   return SUCCESS;
 }

@@ -13,6 +13,9 @@ HashTable closures;
 static zval exit_handler;
 static int exit_handler_set = 0;
 static int sealed = 0;
+#if PHP_VERSION_ID >= 80400
+static int exit_intercepted_84 = 0;  // Track if exit was intercepted on PHP 8.4+
+#endif
 
 // Thread-local storage for call context
 __thread int internal_call_context = 0;
@@ -46,20 +49,30 @@ ZEND_END_ARG_INFO()
 
 
 
+// PHP < 8.4: exit is an opcode, intercept via opcode handler
+// PHP >= 8.4: exit is a function, intercept via trapbox_intercept
+#if PHP_VERSION_ID < 80400
 int trapbox_exit_handler(zend_execute_data *execute_data) {
     zval retval;
-    zval args[1]; // Argument to pass to the closure
+    zval args[1];
     zval *status = NULL;
+    const zend_op *opline = execute_data->opline;
 
-    if (EX_NUM_ARGS() > 0) {
-        status = ZEND_CALL_ARG(execute_data, 1);
+    // Get the exit status from the opcode operand
+    if (opline->op1_type == IS_CONST) {
+        status = RT_CONSTANT(opline, opline->op1);
+    } else if (opline->op1_type != IS_UNUSED) {
+        status = EX_VAR(opline->op1.var);
     }
 
     if (exit_handler_set && Z_TYPE(exit_handler) == IS_OBJECT) {
-        // Call the configured closure
         ZVAL_NULL(&retval);
 
-        ZVAL_COPY(&args[0], status ? status : &EG(uninitialized_zval));
+        if (status) {
+            ZVAL_COPY(&args[0], status);
+        } else {
+            ZVAL_LONG(&args[0], 0);
+        }
 
         if (call_user_function(EG(function_table), NULL, &exit_handler, &retval, 1, args) == FAILURE) {
             php_printf("[Trapbox] Failed to invoke exit handler\n");
@@ -74,6 +87,7 @@ int trapbox_exit_handler(zend_execute_data *execute_data) {
     // Prevent actual exit
     return ZEND_USER_OPCODE_RETURN;
 }
+#endif
 
 
 
@@ -106,7 +120,31 @@ ZEND_FUNCTION(replacement_function)
   }
 
   zend_string *original_function_name = execute_data->func->common.function_name;
-  // zend_function *original_func = (zend_function*)zend_hash_find_ptr(&original_functions, original_function_name);
+
+#if PHP_VERSION_ID >= 80400
+  // Special handling for exit() when using trapbox_set_exit_handler on PHP 8.4+
+  if (exit_handler_set &&
+      ZSTR_LEN(original_function_name) == 4 &&
+      memcmp(ZSTR_VAL(original_function_name), "exit", 4) == 0) {
+
+      zval handler_retval;
+      zval handler_args[1];
+
+      ZVAL_NULL(&handler_retval);
+      if (num_args > 0) {
+          ZVAL_COPY(&handler_args[0], &args[0]);
+      } else {
+          ZVAL_LONG(&handler_args[0], 0);
+      }
+
+      call_user_function(EG(function_table), NULL, &exit_handler, &handler_retval, 1, handler_args);
+
+      zval_ptr_dtor(&handler_args[0]);
+      efree(args);
+
+      RETURN_ZVAL(&handler_retval, 0, 1);
+  }
+#endif
 
   intercepted_function *replacement = (intercepted_function *)execute_data->func;
   zend_function *original_func = replacement->original_func;
@@ -282,6 +320,36 @@ PHP_FUNCTION(trapbox_set_exit_handler) {
     ZVAL_COPY(&exit_handler, handler);
     exit_handler_set = 1;
 
+#if PHP_VERSION_ID >= 80400
+    // On PHP 8.4+, exit() is a regular function - intercept it
+    if (!exit_intercepted_84) {
+        zend_string *function_name_str = zend_string_init("exit", 4, 0);
+        zval *original_function_zval;
+
+        if ((original_function_zval = zend_hash_find(EG(function_table), function_name_str)) != NULL) {
+            // Store original function
+            zend_hash_add_ptr(&replaced_functions, function_name_str, Z_PTR_P(original_function_zval));
+
+            // Create replacement
+            intercepted_function *replacement = emalloc(sizeof(intercepted_function));
+            zend_function *original_func_copy = emalloc(sizeof(zend_function));
+            memcpy(original_func_copy, Z_PTR_P(original_function_zval), sizeof(zend_function));
+            replacement->original_func = original_func_copy;
+            memcpy(&replacement->func, Z_PTR_P(original_function_zval), sizeof(zend_function));
+            replacement->func.common.function_name = zend_string_copy(function_name_str);
+            replacement->func.internal_function.handler = ZEND_FN(replacement_function);
+
+            // Replace in function table
+            zend_hash_del(EG(function_table), function_name_str);
+            zend_hash_add_ptr(EG(function_table), function_name_str, replacement);
+
+            exit_intercepted_84 = 1;
+        }
+
+        zend_string_release(function_name_str);
+    }
+#endif
+
     RETURN_TRUE;
 }
 
@@ -335,7 +403,9 @@ PHP_MINIT_FUNCTION(trapbox)
 {
   zend_hash_init(&replaced_functions, 8, NULL, NULL, 1);
   zend_hash_init(&closures, 8, NULL, ZVAL_PTR_DTOR, 1);
+#if PHP_VERSION_ID < 80400
   zend_set_user_opcode_handler(ZEND_EXIT, trapbox_exit_handler);
+#endif
 
   return SUCCESS;
 }

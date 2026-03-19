@@ -202,10 +202,10 @@ ZEND_FUNCTION(replacement_function)
       exit_internal_call();
 
       zval_ptr_dtor(&original_func_zval);
+      efree(fci.params);
   }
 
   efree(args);
-  efree(fci.params);
 
   RETURN_ZVAL(&retval, 0, 0);
 }

@@ -5,6 +5,25 @@
 
 set -e
 
+# Auto-detect container runtime
+if command -v docker &>/dev/null; then
+    RUNTIME="docker"
+elif command -v nerdctl &>/dev/null; then
+    # Check if nerdctl works without sudo (rootless) or needs sudo
+    if nerdctl info &>/dev/null 2>&1; then
+        RUNTIME="nerdctl"
+    elif sudo nerdctl info &>/dev/null 2>&1; then
+        RUNTIME="sudo nerdctl"
+    else
+        echo "Error: nerdctl found but not functional (rootless or with sudo)"
+        exit 1
+    fi
+else
+    echo "Error: No container runtime found (docker or nerdctl)"
+    exit 1
+fi
+echo "Using container runtime: $RUNTIME"
+
 VERSIONS=("7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAILED=()
@@ -26,7 +45,8 @@ rm -f "$SCRIPT_DIR/trapbox.dep" 2>/dev/null
 for VERSION in "${VERSIONS[@]}"; do
     echo -e "\n${YELLOW}Testing PHP $VERSION...${NC}"
 
-    if docker run --rm -v "$SCRIPT_DIR:/ext" -w /ext "php:$VERSION-cli" sh -c '
+    if $RUNTIME run --rm -v "$SCRIPT_DIR:/ext" -w /ext "php:$VERSION-cli" sh -c '
+        make clean >/dev/null 2>&1
         phpize --clean >/dev/null 2>&1
         phpize >/dev/null 2>&1 && \
         ./configure >/dev/null 2>&1 && \

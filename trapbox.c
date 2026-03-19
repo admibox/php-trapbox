@@ -65,24 +65,27 @@ int trapbox_exit_handler(zend_execute_data *execute_data) {
         status = EX_VAR(opline->op1.var);
     }
 
-    if (exit_handler_set && Z_TYPE(exit_handler) == IS_OBJECT) {
-        ZVAL_NULL(&retval);
+    if (!exit_handler_set || Z_TYPE(exit_handler) != IS_OBJECT) {
+        // No handler set: let PHP handle exit normally
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
 
-        if (status) {
-            ZVAL_COPY(&args[0], status);
-        } else {
-            ZVAL_LONG(&args[0], 0);
-        }
+    ZVAL_NULL(&retval);
 
-        if (call_user_function(EG(function_table), NULL, &exit_handler, &retval, 1, args) == FAILURE) {
-            php_printf("[Trapbox] Failed to invoke exit handler\n");
-        }
+    if (status) {
+        ZVAL_COPY(&args[0], status);
+    } else {
+        ZVAL_LONG(&args[0], 0);
+    }
 
+    if (call_user_function(EG(function_table), NULL, &exit_handler, &retval, 1, args) == FAILURE) {
         zval_ptr_dtor(&args[0]);
         zval_ptr_dtor(&retval);
-    } else {
-        php_printf("[Trapbox] No handler set for exit\n");
+        return ZEND_USER_OPCODE_DISPATCH;
     }
+
+    zval_ptr_dtor(&args[0]);
+    zval_ptr_dtor(&retval);
 
     return ZEND_USER_OPCODE_RETURN;
 }

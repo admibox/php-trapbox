@@ -52,10 +52,11 @@ for VERSION in "${VERSIONS[@]}"; do
         ./configure >/dev/null 2>&1 && \
         make >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
         LOG=/tmp/trapbox-test.jsonl
-        php -dextension=modules/trapbox.so -dtrapbox.log_path=$LOG test.php 2>&1 || exit 1
+        FLAGS="-dextension=modules/trapbox.so -dtrapbox.log_path=$LOG -dallow_url_include=1 -dphar.readonly=0"
+        php $FLAGS test.php 2>&1 || exit 1
         for MODE in off block trap; do
-            for CATEGORY in exec eval; do
-                RESULT=$(php -dextension=modules/trapbox.so -dtrapbox.log_path=$LOG -dtrapbox.$CATEGORY=$MODE test_$CATEGORY.php 2>&1)
+            for CATEGORY in exec eval include; do
+                RESULT=$(php $FLAGS -dtrapbox.$CATEGORY=$MODE test_$CATEGORY.php 2>&1)
                 CODE=$?
                 echo "$RESULT"
                 [ $CODE -eq 0 ] || { echo "FAIL: exit code $CODE in $CATEGORY mode $MODE"; exit 1; }

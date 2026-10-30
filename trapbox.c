@@ -487,6 +487,64 @@ static zend_op_array *trapbox_compile_string(zval *source, char *filename)
 }
 #endif
 
+/* ── include interception (zend_compile_file) ─────────────────── */
+
+static zend_op_array *(*trapbox_prev_compile_file)(zend_file_handle *file_handle, int type) = NULL;
+
+/* Any stream wrapper except file://, so wrappers we did not think of are still caught */
+static int trapbox_is_wrapper_path(const char *path)
+{
+  const char *p = path;
+  if (strncasecmp(path, "data:", 5) == 0) return 1;
+  while (isalnum((unsigned char)*p) || *p == '+' || *p == '-' || *p == '.') p++;
+  if (p == path || strncmp(p, "://", 3) != 0) return 0;
+  return !((p - path) == 4 && strncasecmp(path, "file", 4) == 0);
+}
+
+static zend_op_array *trapbox_compile_trap(const char *filename)
+{
+  zend_op_array *op_array;
+#if PHP_VERSION_ID >= 80000
+  zend_string *trap = zend_string_init("return 1;", sizeof("return 1;") - 1, 0);
+# if PHP_VERSION_ID >= 80200
+  op_array = trapbox_prev_compile_string(trap, filename, ZEND_COMPILE_POSITION_AFTER_OPEN_TAG);
+# else
+  op_array = trapbox_prev_compile_string(trap, filename);
+# endif
+  zend_string_release(trap);
+#else
+  zval trap;
+  ZVAL_STRINGL(&trap, "return 1;", sizeof("return 1;") - 1);
+  op_array = trapbox_prev_compile_string(&trap, (char *)filename);
+  zval_ptr_dtor(&trap);
+#endif
+  return op_array;
+}
+
+static zend_op_array *trapbox_compile_file(zend_file_handle *file_handle, int type)
+{
+#if PHP_VERSION_ID >= 80100
+  const char *filename = file_handle->filename ? ZSTR_VAL(file_handle->filename) : NULL;
+#else
+  const char *filename = file_handle->filename;
+#endif
+
+  if (!filename || !trapbox_is_wrapper_path(filename)) {
+    return trapbox_prev_compile_file(file_handle, type);
+  }
+
+  enum trapbox_mode mode = trapbox_parse_mode(TRAPBOX_G(mode_include));
+  const char *arg_strs[1] = { filename };
+  size_t arg_lens[1] = { strlen(filename) };
+  trapbox_log_event("include", trapbox_mode_name(mode), "include", arg_strs, arg_lens, 1);
+
+  /* include evaluates to false on block. require does not halt: the caller sees false too */
+  if (mode == TRAPBOX_MODE_BLOCK) return NULL;
+  /* trap mimics a successful include of a file with no return statement */
+  if (mode == TRAPBOX_MODE_TRAP) return trapbox_compile_trap(filename);
+  return trapbox_prev_compile_file(file_handle, type);
+}
+
 static void trapbox_install_hooks(trapbox_hook *hooks, zif_handler handler)
 {
   for (trapbox_hook *hook = hooks; hook->name; hook++) {
@@ -520,8 +578,8 @@ PHP_MINIT_FUNCTION(trapbox)
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
     trapbox_install_hooks(trapbox_exec_hooks, ZEND_FN(trapbox_exec_handler));
   }
+  trapbox_prev_compile_string = zend_compile_string;
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_eval)) != TRAPBOX_MODE_OFF) {
-    trapbox_prev_compile_string = zend_compile_string;
     zend_compile_string = trapbox_compile_string;
   }
   return SUCCESS;
@@ -531,6 +589,9 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
 {
   if (zend_compile_string == trapbox_compile_string) {
     zend_compile_string = trapbox_prev_compile_string;
+  }
+  if (zend_compile_file == trapbox_compile_file) {
+    zend_compile_file = trapbox_prev_compile_file;
   }
   UNREGISTER_INI_ENTRIES();
   return SUCCESS;
@@ -548,6 +609,14 @@ PHP_RINIT_FUNCTION(trapbox)
   TRAPBOX_G(client_ip) = NULL;
   TRAPBOX_G(server_ht) = NULL;
   TRAPBOX_G(request_body) = NULL;
+
+  /* Installed here rather than in MINIT: OPcache hooks after MINIT and would sit in front,
+     hiding cached phar:// includes. Runs once per process. */
+  if (!trapbox_prev_compile_file && TRAPBOX_G(enabled)
+      && trapbox_parse_mode(TRAPBOX_G(mode_include)) != TRAPBOX_MODE_OFF) {
+    trapbox_prev_compile_file = zend_compile_file;
+    zend_compile_file = trapbox_compile_file;
+  }
   return SUCCESS;
 }
 

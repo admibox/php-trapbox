@@ -62,9 +62,9 @@ PHP 7.3 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` fo
 
 ### Module lifecycle
 
-- **MINIT**: Register ini settings, patch function handlers in place, swap compile hooks
+- **MINIT**: Register ini settings, patch function handlers in place, swap `zend_compile_string`
 - **MSHUTDOWN**: Restore compile hooks
-- **RINIT**: Generate correlation ID, initialize per-request state
+- **RINIT**: Generate correlation ID, initialize per-request state. The first RINIT of each process swaps `zend_compile_file`, because OPcache hooks it after MINIT and would otherwise hide cached `phar://` includes
 - **RSHUTDOWN**: Release per-request state
 
 Function handlers are patched **once in MINIT and never restored**. Swapping function table entries per request (the v1 approach) crashes php-fpm under JIT: compiled code keeps a pointer to the freed entry. All mode settings are `PHP_INI_SYSTEM`, so a process-lifetime decision is correct. `test-fpm.sh` exists to catch this class of bug; run it for any change to hooking.

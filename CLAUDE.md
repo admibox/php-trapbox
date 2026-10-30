@@ -54,6 +54,8 @@ Single source file: `trapbox.c`. Header: `php_trapbox.h`.
 - All modes default to `bypass`: installing the extension must not change application behavior.
 - `trapbox.exec = trap` currently behaves like `block` (returns `false`). Fake output is pending, see the open questions in the design plan.
 
+- `file_write` and `secret_read` filter by the literal path: `/etc//passwd` evades `/etc/passwd`, and a symlink evades both. Writes and reads through `SplFileObject`, `fprintf`, `stream_copy_to_stream` and similar are not hooked. `file_put_contents` data given as an array or stream is not logged.
+
 ### Version compatibility
 
 PHP 7.3 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` for:

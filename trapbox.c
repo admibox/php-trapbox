@@ -33,6 +33,7 @@ PHP_INI_BEGIN()
   STD_PHP_INI_ENTRY("trapbox.file_write_extensions", "php,phtml,inc,htaccess,user.ini,js,html", PHP_INI_SYSTEM, OnUpdateString, file_write_extensions, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_BOOLEAN("trapbox.file_write_any_path", "0", PHP_INI_SYSTEM, OnUpdateBool, file_write_any_path, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.secret_paths", "env.php,.env,wp-config.php,/etc/passwd,/etc/shadow", PHP_INI_SYSTEM, OnUpdateString, secret_paths, zend_trapbox_globals, trapbox_globals)
+  STD_PHP_INI_ENTRY("trapbox.canary_env_path", "", PHP_INI_SYSTEM, OnUpdateString, canary_env_path, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.max_arg_size", "65536", PHP_INI_SYSTEM, OnUpdateLong, max_arg_size, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.max_body_size", "1048576", PHP_INI_SYSTEM, OnUpdateLong, max_body_size, zend_trapbox_globals, trapbox_globals)
 PHP_INI_END()
@@ -545,6 +546,300 @@ static zend_op_array *trapbox_compile_file(zend_file_handle *file_handle, int ty
   return trapbox_prev_compile_file(file_handle, type);
 }
 
+/* ── file writes and secret reads ─────────────────────────────── */
+
+/* These functions run thousands of times per page: no allocation or name lookup on the path that does not match */
+typedef enum {
+  TRAPBOX_FS_WRITE,   /* path_arg is the destination */
+  TRAPBOX_FS_STREAM,  /* first argument is a stream, its path decides */
+  TRAPBOX_FS_READ,    /* path_arg is the file read */
+  TRAPBOX_FS_OPEN,    /* read or write, depending on the mode argument */
+  TRAPBOX_FS_COPY     /* destination can be code, source can be a secret */
+} trapbox_fs_kind;
+
+typedef struct {
+  const char *name;
+  trapbox_fs_kind kind;
+  int path_arg;
+  int returns_length;
+  zif_handler handler;
+  zif_handler original;
+} trapbox_fs_hook;
+
+#define TRAPBOX_FS_LIST(X) \
+  X(file_put_contents, TRAPBOX_FS_WRITE, 0, 1) \
+  X(rename, TRAPBOX_FS_WRITE, 1, 0) \
+  X(symlink, TRAPBOX_FS_WRITE, 1, 0) \
+  X(link, TRAPBOX_FS_WRITE, 1, 0) \
+  X(move_uploaded_file, TRAPBOX_FS_WRITE, 1, 0) \
+  X(chmod, TRAPBOX_FS_WRITE, 0, 0) \
+  X(mkdir, TRAPBOX_FS_WRITE, 0, 0) \
+  X(fwrite, TRAPBOX_FS_STREAM, 0, 1) \
+  X(fputs, TRAPBOX_FS_STREAM, 0, 1) \
+  X(file_get_contents, TRAPBOX_FS_READ, 0, 0) \
+  X(readfile, TRAPBOX_FS_READ, 0, 0) \
+  X(file, TRAPBOX_FS_READ, 0, 0) \
+  X(parse_ini_file, TRAPBOX_FS_READ, 0, 0) \
+  X(fopen, TRAPBOX_FS_OPEN, 0, 0) \
+  X(copy, TRAPBOX_FS_COPY, 1, 0)
+
+enum {
+#define X(fn, kind, path_arg, returns_length) TRAPBOX_FS_INDEX_##fn,
+  TRAPBOX_FS_LIST(X)
+#undef X
+  TRAPBOX_FS_COUNT
+};
+
+static trapbox_fs_hook trapbox_fs_hooks[TRAPBOX_FS_COUNT];
+
+#define TRAPBOX_MAX_LIST_ITEMS 64
+
+typedef struct {
+  char *items[TRAPBOX_MAX_LIST_ITEMS];
+  size_t lengths[TRAPBOX_MAX_LIST_ITEMS];
+  int count;
+} trapbox_list;
+
+static trapbox_list trapbox_write_extensions;
+static trapbox_list trapbox_secret_paths;
+static enum trapbox_mode trapbox_file_write_mode = TRAPBOX_MODE_OFF;
+static enum trapbox_mode trapbox_secret_read_mode = TRAPBOX_MODE_OFF;
+
+static void trapbox_list_parse(trapbox_list *list, const char *value, const char *setting)
+{
+  const char *start = value;
+  list->count = 0;
+  while (start && *start) {
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len > 0) {
+      if (list->count == TRAPBOX_MAX_LIST_ITEMS) {
+        zend_error(E_WARNING, "trapbox: %s has more than %d items, the rest are ignored", setting, TRAPBOX_MAX_LIST_ITEMS);
+        return;
+      }
+      list->items[list->count] = pestrndup(start, len, 1);
+      list->lengths[list->count] = len;
+      list->count++;
+    }
+    start = end ? end + 1 : NULL;
+  }
+}
+
+static void trapbox_list_free(trapbox_list *list)
+{
+  for (int i = 0; i < list->count; i++) {
+    pefree(list->items[i], 1);
+  }
+  list->count = 0;
+}
+
+static int trapbox_is_write_target(const char *path, size_t len)
+{
+  for (int i = 0; i < trapbox_write_extensions.count; i++) {
+    size_t ext_len = trapbox_write_extensions.lengths[i];
+    if (len > ext_len && path[len - ext_len - 1] == '.'
+        && strcasecmp(path + len - ext_len, trapbox_write_extensions.items[i]) == 0) {
+      return 1;
+    }
+  }
+  /* php:// streams are output and buffers, not files on disk */
+  return TRAPBOX_G(file_write_any_path) && strncmp(path, "php://", 6) != 0;
+}
+
+static int trapbox_is_secret(const char *path)
+{
+  for (int i = 0; i < trapbox_secret_paths.count; i++) {
+    if (strstr(path, trapbox_secret_paths.items[i])) return 1;
+  }
+  return 0;
+}
+
+static zval *trapbox_fs_arg(zend_execute_data *execute_data, int index)
+{
+  zval *arg;
+  if ((uint32_t)index >= ZEND_NUM_ARGS()) return NULL;
+  arg = ZEND_CALL_ARG(execute_data, index + 1);
+  ZVAL_DEREF(arg);
+  return arg;
+}
+
+/* Objects with __toString are accepted as paths by PHP, so they must not evade the filter */
+static zend_string *trapbox_fs_path(zval *arg)
+{
+  if (!arg) return NULL;
+  if (Z_TYPE_P(arg) == IS_STRING) return zend_string_copy(Z_STR_P(arg));
+  if (Z_TYPE_P(arg) == IS_OBJECT && Z_OBJCE_P(arg)->__tostring) {
+    zend_string *path = zval_get_string(arg);
+    if (EG(exception)) {
+      zend_string_release(path);
+      return NULL;
+    }
+    return path;
+  }
+  return NULL;
+}
+
+static void trapbox_fs_replace_arg(zend_execute_data *execute_data, int index, const char *value)
+{
+  zval *arg = ZEND_CALL_ARG(execute_data, index + 1);
+  zval_ptr_dtor(arg);
+  ZVAL_STRING(arg, value);
+}
+
+static void trapbox_fs_log(zend_execute_data *execute_data, const trapbox_fs_hook *hook, const char *category,
+                           enum trapbox_mode mode, const char *target, size_t target_len)
+{
+  const char *arg_strs[2];
+  size_t arg_lens[2];
+  int count = 0;
+
+  for (int i = 0; i < 2; i++) {
+    zval *arg = trapbox_fs_arg(execute_data, i);
+    if (i == hook->path_arg) {
+      arg_strs[count] = target;
+      arg_lens[count] = target_len;
+      count++;
+    } else if (arg && Z_TYPE_P(arg) == IS_STRING) {
+      arg_strs[count] = Z_STRVAL_P(arg);
+      arg_lens[count] = Z_STRLEN_P(arg);
+      count++;
+    }
+  }
+  trapbox_log_event(category, trapbox_mode_name(mode), hook->name, arg_strs, arg_lens, count);
+}
+
+static void trapbox_fs_trap_write(INTERNAL_FUNCTION_PARAMETERS, const trapbox_fs_hook *hook, const char *target, size_t target_len)
+{
+  if (hook->kind == TRAPBOX_FS_OPEN) {
+    /* The attacker gets a working handle. It keeps the original path so their fwrite is logged with its content. */
+    char *path = estrndup(target, target_len);
+    trapbox_fs_replace_arg(execute_data, 0, "php://memory");
+    hook->original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    if (Z_TYPE_P(return_value) == IS_RESOURCE) {
+      php_stream *stream = (php_stream *)Z_RES_P(return_value)->ptr;
+      if (stream->orig_path) pefree(stream->orig_path, stream->is_persistent);
+      stream->orig_path = pestrdup(path, stream->is_persistent);
+    }
+    efree(path);
+    return;
+  }
+  if (hook->returns_length) {
+    zval *data = trapbox_fs_arg(execute_data, 1);
+    RETURN_LONG(data && Z_TYPE_P(data) == IS_STRING ? (zend_long)Z_STRLEN_P(data) : 0);
+  }
+  RETURN_TRUE;
+}
+
+static void trapbox_fs_dispatch(INTERNAL_FUNCTION_PARAMETERS, const trapbox_fs_hook *hook)
+{
+  zend_string *path = NULL;
+  const char *target = NULL;
+  size_t target_len = 0;
+  int is_write = 0, is_read = 0, read_arg = 0;
+
+  if (hook->kind == TRAPBOX_FS_STREAM) {
+    zval *arg = trapbox_fs_arg(execute_data, 0);
+    if (arg && Z_TYPE_P(arg) == IS_RESOURCE
+        && (Z_RES_P(arg)->type == php_file_le_stream() || Z_RES_P(arg)->type == php_file_le_pstream())) {
+      target = ((php_stream *)Z_RES_P(arg)->ptr)->orig_path;
+      target_len = target ? strlen(target) : 0;
+    }
+  } else {
+    path = trapbox_fs_path(trapbox_fs_arg(execute_data, hook->path_arg));
+    if (path) {
+      target = ZSTR_VAL(path);
+      target_len = ZSTR_LEN(path);
+    }
+  }
+
+  if (target) {
+    switch (hook->kind) {
+      case TRAPBOX_FS_WRITE:
+      case TRAPBOX_FS_STREAM:
+        is_write = trapbox_is_write_target(target, target_len);
+        break;
+      case TRAPBOX_FS_READ:
+        is_read = trapbox_is_secret(target);
+        break;
+      case TRAPBOX_FS_OPEN: {
+        zval *open_mode = trapbox_fs_arg(execute_data, 1);
+        if (open_mode && Z_TYPE_P(open_mode) == IS_STRING) {
+          is_write = strpbrk(Z_STRVAL_P(open_mode), "wacx+") && trapbox_is_write_target(target, target_len);
+          is_read = !is_write && Z_STRVAL_P(open_mode)[0] == 'r' && trapbox_is_secret(target);
+        }
+        break;
+      }
+      case TRAPBOX_FS_COPY: {
+        zval *source = trapbox_fs_arg(execute_data, 0);
+        is_write = trapbox_is_write_target(target, target_len);
+        is_read = !is_write && source && Z_TYPE_P(source) == IS_STRING && trapbox_is_secret(Z_STRVAL_P(source));
+        break;
+      }
+    }
+  }
+
+  if (is_write && trapbox_file_write_mode != TRAPBOX_MODE_OFF) {
+    trapbox_fs_log(execute_data, hook, "file_write", trapbox_file_write_mode, target, target_len);
+    if (trapbox_file_write_mode == TRAPBOX_MODE_BLOCK) {
+      RETVAL_FALSE;
+    } else if (trapbox_file_write_mode == TRAPBOX_MODE_TRAP) {
+      trapbox_fs_trap_write(INTERNAL_FUNCTION_PARAM_PASSTHRU, hook, target, target_len);
+    } else {
+      hook->original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    }
+  } else if (is_read && trapbox_secret_read_mode != TRAPBOX_MODE_OFF) {
+    trapbox_fs_log(execute_data, hook, "secret_read", trapbox_secret_read_mode, target, target_len);
+    if (trapbox_secret_read_mode == TRAPBOX_MODE_BLOCK) {
+      RETVAL_FALSE;
+    } else {
+      if (trapbox_secret_read_mode == TRAPBOX_MODE_TRAP) {
+        /* The real function reads the canary, so every reader keeps its exact return shape */
+        const char *canary = TRAPBOX_G(canary_env_path);
+        trapbox_fs_replace_arg(execute_data, read_arg, canary && *canary ? canary : "/dev/null");
+      }
+      hook->original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    }
+  } else {
+    hook->original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+  }
+
+  if (path) zend_string_release(path);
+}
+
+#define X(fn, kind, path_arg, returns_length) \
+  static ZEND_NAMED_FUNCTION(trapbox_fs_##fn) { \
+    trapbox_fs_dispatch(INTERNAL_FUNCTION_PARAM_PASSTHRU, &trapbox_fs_hooks[TRAPBOX_FS_INDEX_##fn]); \
+  }
+TRAPBOX_FS_LIST(X)
+#undef X
+
+static trapbox_fs_hook trapbox_fs_hooks[TRAPBOX_FS_COUNT] = {
+#define X(fn, kind, path_arg, returns_length) {#fn, kind, path_arg, returns_length, trapbox_fs_##fn, NULL},
+  TRAPBOX_FS_LIST(X)
+#undef X
+};
+
+static void trapbox_install_fs_hooks(void)
+{
+  int writes = trapbox_file_write_mode != TRAPBOX_MODE_OFF;
+  int reads = trapbox_secret_read_mode != TRAPBOX_MODE_OFF;
+
+  for (int i = 0; i < TRAPBOX_FS_COUNT; i++) {
+    trapbox_fs_hook *hook = &trapbox_fs_hooks[i];
+    int needed = hook->kind == TRAPBOX_FS_READ ? reads
+      : (hook->kind == TRAPBOX_FS_OPEN || hook->kind == TRAPBOX_FS_COPY) ? (reads || writes)
+      : writes;
+    zend_function *func;
+
+    if (!needed) continue;
+    func = zend_hash_str_find_ptr(CG(function_table), hook->name, strlen(hook->name));
+    if (func && func->type == ZEND_INTERNAL_FUNCTION) {
+      hook->original = func->internal_function.handler;
+      func->internal_function.handler = hook->handler;
+    }
+  }
+}
+
 static void trapbox_install_hooks(trapbox_hook *hooks, zif_handler handler)
 {
   for (trapbox_hook *hook = hooks; hook->name; hook++) {
@@ -578,6 +873,14 @@ PHP_MINIT_FUNCTION(trapbox)
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
     trapbox_install_hooks(trapbox_exec_hooks, ZEND_FN(trapbox_exec_handler));
   }
+  trapbox_list_parse(&trapbox_write_extensions, TRAPBOX_G(file_write_extensions), "trapbox.file_write_extensions");
+  trapbox_list_parse(&trapbox_secret_paths, TRAPBOX_G(secret_paths), "trapbox.secret_paths");
+  if (TRAPBOX_G(enabled)) {
+    trapbox_file_write_mode = trapbox_parse_mode(TRAPBOX_G(mode_file_write));
+    trapbox_secret_read_mode = trapbox_parse_mode(TRAPBOX_G(mode_secret_read));
+    trapbox_install_fs_hooks();
+  }
+
   trapbox_prev_compile_string = zend_compile_string;
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_eval)) != TRAPBOX_MODE_OFF) {
     zend_compile_string = trapbox_compile_string;
@@ -593,6 +896,8 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
   if (zend_compile_file == trapbox_compile_file) {
     zend_compile_file = trapbox_prev_compile_file;
   }
+  trapbox_list_free(&trapbox_write_extensions);
+  trapbox_list_free(&trapbox_secret_paths);
   UNREGISTER_INI_ENTRIES();
   return SUCCESS;
 }

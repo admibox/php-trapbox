@@ -21,9 +21,10 @@ $fail = function ($msg) use (&$failed, $label) { echo "FAIL: $label: $msg\n"; $f
 $phar = new Phar('/tmp/trapbox-fpm.phar');
 $phar['x.php'] = '<?php return "trapbox_phar_marker";';
 unset($phar);
+file_put_contents('/tmp/trapbox-fpm-env.php', 'secret');
 file_put_contents($conf, "[global]\nerror_log=$fpmLog\ndaemonize=no\n[www]\nlisten=127.0.0.1:$port\npm=static\npm.max_children=1\ncatch_workers_output=yes\n");
 
-$flags = "-dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=$mode -dtrapbox.eval=$mode -dtrapbox.include=$mode -dopcache.enable=1 -dopcache.validate_timestamps=0 -dopcache.file_update_protection=0";
+$flags = "-dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=$mode -dtrapbox.eval=$mode -dtrapbox.include=$mode -dtrapbox.file_write=$mode -dtrapbox.secret_read=$mode -dopcache.enable=1 -dopcache.validate_timestamps=0 -dopcache.file_update_protection=0";
 if (strpos((string) shell_exec('php-fpm -m'), 'Zend OPcache') === false) {
     $flags = "-dzend_extension=opcache $flags";
 }
@@ -110,7 +111,7 @@ for ($i = 0; $i < $requests; $i++) {
         break;
     }
     $pids[$data['pid']] = true;
-    if ($data['ran'] !== $shouldRun || $data['evaluated'] !== $shouldRun || $data['included'] !== $shouldRun) {
+    if ($data['ran'] !== $shouldRun || $data['evaluated'] !== $shouldRun || $data['included'] !== $shouldRun || $data['read'] !== $shouldRun || $data['wrote'] !== $shouldRun) {
         $fail("request $i: " . json_encode($data));
         break;
     }
@@ -133,8 +134,8 @@ if (preg_match('/SIG[A-Z]+|Segmentation|core dumped|exited on signal|zend_mm_hea
 }
 
 $lines = is_file($log) ? file($log, FILE_IGNORE_NEW_LINES) : [];
-// 3 exec + 3 eval + 1 include per request. The include count proves OPcache does not hide cached phars.
-$expected = $mode === 'off' ? 0 : $requests * 7;
+// 3 exec + 3 eval + 1 include + 1 read + 1 write per request. The include count proves OPcache does not hide cached phars.
+$expected = $mode === 'off' ? 0 : $requests * 9;
 if (count($lines) !== $expected) $fail('expected ' . $expected . ' events, got ' . count($lines));
 
 $rids = [];

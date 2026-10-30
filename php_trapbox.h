@@ -22,6 +22,7 @@ ZEND_BEGIN_MODULE_GLOBALS(trapbox)
   char *file_write_extensions;
   zend_bool file_write_any_path;
   char *secret_paths;
+  char *canary_env_path;
   zend_long max_arg_size;
   zend_long max_body_size;
 

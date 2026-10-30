@@ -61,8 +61,22 @@ if (count($lines) !== 1) {
 $typo = shell_exec(escapeshellarg(PHP_BINARY) . " -dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=blokc -r 'echo shell_exec(\"echo ran\");' 2>&1");
 if (strpos((string) $typo, 'ran') === false) $fail('invalid mode changed behavior');
 if (strpos((string) $typo, 'invalid value') === false) $fail('invalid mode raised no warning');
-if (!is_file($log)) $fail('invalid mode did not keep logging');
+// php -r itself produces an eval event, so the category must be checked, not just the log's existence
+$hasCategory = function ($category) use ($log) {
+    return is_file($log) && strpos(file_get_contents($log), "\"category\":\"$category\"") !== false;
+};
+if (!$hasCategory('exec')) $fail('invalid mode did not keep logging');
 @unlink($log);
+
+$anyPath = PHP_BINARY . " -dextension=$ext -dtrapbox.log_path=$log";
+$write = "-r 'file_put_contents(\"/tmp/trapbox-any.txt\", \"y\");'";
+shell_exec("$anyPath $write 2>&1");
+if ($hasCategory('file_write')) $fail('a plain write was logged without file_write_any_path');
+@unlink($log);
+shell_exec("$anyPath -dtrapbox.file_write_any_path=1 $write 2>&1");
+if (!$hasCategory('file_write')) $fail('file_write_any_path did not log a plain write');
+@unlink($log);
+@unlink('/tmp/trapbox-any.txt');
 
 if ($failed) exit(1);
 echo "OK: real HTTP request logged correctly\n";

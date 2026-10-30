@@ -29,6 +29,8 @@ ZEND_BEGIN_MODULE_GLOBALS(trapbox)
   /* per-request state */
   char rid[13];
   int request_captured;
+  int in_request;
+  int in_error;
   const char *request_method;
   const char *request_uri;
   const char *client_ip;

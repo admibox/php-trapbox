@@ -6,6 +6,9 @@
 #include "php_trapbox.h"
 #include "SAPI.h"
 #include "zend_smart_str.h"
+#if PHP_VERSION_ID >= 80000
+#include "zend_observer.h"
+#endif
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -840,6 +843,141 @@ static void trapbox_install_fs_hooks(void)
   }
 }
 
+/* ── unserialize ──────────────────────────────────────────────── */
+
+static trapbox_hook trapbox_unserialize_hooks[] = {
+  {"unserialize", NULL}, {NULL, NULL}
+};
+
+ZEND_FUNCTION(trapbox_unserialize_handler)
+{
+  enum trapbox_mode mode = trapbox_parse_mode(TRAPBOX_G(mode_unserialize));
+  zif_handler original = trapbox_unserialize_hooks[0].original;
+  zval *payload = trapbox_fs_arg(execute_data, 0);
+  zval *options = trapbox_fs_arg(execute_data, 1);
+
+  /* Payloads without objects cannot trigger gadget chains, and caches call this constantly */
+  int has_objects = payload && Z_TYPE_P(payload) == IS_STRING
+    && (php_memnstr(Z_STRVAL_P(payload), "O:", 2, Z_STRVAL_P(payload) + Z_STRLEN_P(payload))
+        || php_memnstr(Z_STRVAL_P(payload), "C:", 2, Z_STRVAL_P(payload) + Z_STRLEN_P(payload)));
+
+  if (has_objects && options && Z_TYPE_P(options) == IS_ARRAY) {
+    zval *allowed = zend_hash_str_find(Z_ARRVAL_P(options), "allowed_classes", sizeof("allowed_classes") - 1);
+    if (allowed && Z_TYPE_P(allowed) == IS_FALSE) has_objects = 0;
+  }
+
+  if (!has_objects) {
+    original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    return;
+  }
+
+  {
+    const char *arg_strs[1] = { Z_STRVAL_P(payload) };
+    size_t arg_lens[1] = { Z_STRLEN_P(payload) };
+    trapbox_log_event("unserialize", trapbox_mode_name(mode), "unserialize", arg_strs, arg_lens, 1);
+  }
+
+  if (mode == TRAPBOX_MODE_BYPASS) {
+    original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    return;
+  }
+
+  /* block and trap alike: a failed unserialize is the only plausible answer without running the payload */
+  RETURN_FALSE;
+}
+
+/* ── errors ───────────────────────────────────────────────────── */
+
+static int trapbox_errors_enabled = 0;
+
+static int trapbox_mentions_code_path(const char *message)
+{
+  for (int i = 0; i < trapbox_write_extensions.count; i++) {
+    const char *ext = trapbox_write_extensions.items[i];
+    size_t ext_len = trapbox_write_extensions.lengths[i];
+    const char *at = message;
+    while ((at = strcasestr(at, ext)) != NULL) {
+      if (at > message && at[-1] == '.' && !isalnum((unsigned char)at[ext_len])) return 1;
+      at++;
+    }
+  }
+  return 0;
+}
+
+static int trapbox_is_suspicious_error(int type, const char *filename, const char *message)
+{
+  static const char *const io_failures[] = {
+    "failed to open stream", "permission denied", "read-only file system",
+    "no such file", "open_basedir restriction", NULL
+  };
+
+  if (!(type & (E_WARNING | E_ERROR | E_PARSE | E_COMPILE_ERROR | E_CORE_ERROR | E_RECOVERABLE_ERROR))) return 0;
+
+  if (filename && (strstr(filename, "eval()'d code") || strstr(filename, "Command line code"))) return 1;
+
+  for (const char *const *failure = io_failures; *failure; failure++) {
+    if (strcasestr(message, *failure)) {
+      return trapbox_is_secret(message) || trapbox_mentions_code_path(message);
+    }
+  }
+  return 0;
+}
+
+static void trapbox_on_error(int type, const char *filename, uint32_t lineno, const char *message)
+{
+  const char *level;
+  char *location;
+  const char *arg_strs[2];
+  size_t arg_lens[2];
+
+  /* Logging allocates: reentry and exhausted memory would recurse. Before RINIT there is no request to report. */
+  if (!TRAPBOX_G(in_request) || TRAPBOX_G(in_error)) return;
+  if (!trapbox_is_suspicious_error(type, filename, message)) return;
+
+  TRAPBOX_G(in_error) = 1;
+  level = (type & E_WARNING) ? "E_WARNING" : (type & E_PARSE) ? "E_PARSE" : "E_ERROR";
+  spprintf(&location, 0, "%s:%u", filename ? filename : "", lineno);
+  arg_strs[0] = message;
+  arg_lens[0] = strlen(message);
+  arg_strs[1] = location;
+  arg_lens[1] = strlen(location);
+  /* Errors are only observed, so block and trap have no meaning here */
+  trapbox_log_event("error", "bypass", level, arg_strs, arg_lens, 2);
+  efree(location);
+  TRAPBOX_G(in_error) = 0;
+}
+
+#if PHP_VERSION_ID >= 80100
+static void trapbox_error_observer(int type, zend_string *filename, uint32_t lineno, zend_string *message)
+{
+  if (!trapbox_errors_enabled || strstr(ZSTR_VAL(message), "Allowed memory size")) return;
+  trapbox_on_error(type, filename ? ZSTR_VAL(filename) : NULL, lineno, ZSTR_VAL(message));
+}
+#elif PHP_VERSION_ID >= 80000
+static void trapbox_error_observer(int type, const char *filename, uint32_t lineno, zend_string *message)
+{
+  if (!trapbox_errors_enabled || strstr(ZSTR_VAL(message), "Allowed memory size")) return;
+  trapbox_on_error(type, filename, lineno, ZSTR_VAL(message));
+}
+#else
+static void (*trapbox_prev_error_cb)(int type, const char *filename, const uint32_t lineno, const char *format, va_list args);
+
+static void trapbox_error_cb(int type, const char *filename, const uint32_t lineno, const char *format, va_list args)
+{
+  if (trapbox_errors_enabled && !strstr(format, "Allowed memory size")
+      && TRAPBOX_G(in_request) && !TRAPBOX_G(in_error)) {
+    char *message;
+    va_list copy;
+    va_copy(copy, args);
+    vspprintf(&message, 0, format, copy);
+    va_end(copy);
+    trapbox_on_error(type, filename, lineno, message);
+    efree(message);
+  }
+  trapbox_prev_error_cb(type, filename, lineno, format, args);
+}
+#endif
+
 static void trapbox_install_hooks(trapbox_hook *hooks, zif_handler handler)
 {
   for (trapbox_hook *hook = hooks; hook->name; hook++) {
@@ -881,6 +1019,20 @@ PHP_MINIT_FUNCTION(trapbox)
     trapbox_install_fs_hooks();
   }
 
+  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_unserialize)) != TRAPBOX_MODE_OFF) {
+    trapbox_install_hooks(trapbox_unserialize_hooks, ZEND_FN(trapbox_unserialize_handler));
+  }
+
+  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_errors)) != TRAPBOX_MODE_OFF) {
+    trapbox_errors_enabled = 1;
+#if PHP_VERSION_ID >= 80000
+    zend_observer_error_register(trapbox_error_observer);
+#else
+    trapbox_prev_error_cb = zend_error_cb;
+    zend_error_cb = trapbox_error_cb;
+#endif
+  }
+
   trapbox_prev_compile_string = zend_compile_string;
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_eval)) != TRAPBOX_MODE_OFF) {
     zend_compile_string = trapbox_compile_string;
@@ -896,6 +1048,12 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
   if (zend_compile_file == trapbox_compile_file) {
     zend_compile_file = trapbox_prev_compile_file;
   }
+#if PHP_VERSION_ID < 80000
+  if (zend_error_cb == trapbox_error_cb) {
+    zend_error_cb = trapbox_prev_error_cb;
+  }
+#endif
+  trapbox_errors_enabled = 0;
   trapbox_list_free(&trapbox_write_extensions);
   trapbox_list_free(&trapbox_secret_paths);
   UNREGISTER_INI_ENTRIES();
@@ -914,6 +1072,8 @@ PHP_RINIT_FUNCTION(trapbox)
   TRAPBOX_G(client_ip) = NULL;
   TRAPBOX_G(server_ht) = NULL;
   TRAPBOX_G(request_body) = NULL;
+  TRAPBOX_G(in_error) = 0;
+  TRAPBOX_G(in_request) = 1;
 
   /* Installed here rather than in MINIT: OPcache hooks after MINIT and would sit in front,
      hiding cached phar:// includes. Runs once per process. */
@@ -927,6 +1087,7 @@ PHP_RINIT_FUNCTION(trapbox)
 
 PHP_RSHUTDOWN_FUNCTION(trapbox)
 {
+  TRAPBOX_G(in_request) = 0;
   if (TRAPBOX_G(request_body)) {
     zend_string_release(TRAPBOX_G(request_body));
     TRAPBOX_G(request_body) = NULL;

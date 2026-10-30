@@ -55,7 +55,7 @@ for VERSION in "${VERSIONS[@]}"; do
         FLAGS="-dextension=modules/trapbox.so -dtrapbox.log_path=$LOG -dallow_url_include=1 -dphar.readonly=0 -dtrapbox.canary_env_path=/tmp/trapbox-canary.txt"
         php $FLAGS test.php 2>&1 || exit 1
         for MODE in off block trap; do
-            for CATEGORY in exec eval include file_write secret_read; do
+            for CATEGORY in exec eval include file_write secret_read unserialize errors; do
                 RESULT=$(php $FLAGS -dtrapbox.$CATEGORY=$MODE test_$CATEGORY.php 2>&1)
                 CODE=$?
                 echo "$RESULT"

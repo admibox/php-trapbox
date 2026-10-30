@@ -47,7 +47,7 @@ Single source file: `trapbox.c`. Header: `php_trapbox.h`.
 | include/require | `zend_compile_file` (global fn pointer swap, chains after OPcache) |
 | File writes/reads | Function table replacement + argument filtering |
 | unserialize | Function table replacement |
-| Errors/warnings | `zend_error_cb` (7.x) / `zend_register_error_notify_callback` (8.0+) |
+| Errors/warnings | `zend_error_cb` (7.x) / `zend_observer_error_register` (8.0+) |
 
 ### Current limitations
 
@@ -56,11 +56,14 @@ Single source file: `trapbox.c`. Header: `php_trapbox.h`.
 
 - `file_write` and `secret_read` filter by the literal path: `/etc//passwd` evades `/etc/passwd`, and a symlink evades both. Writes and reads through `SplFileObject`, `fprintf`, `stream_copy_to_stream` and similar are not hooked. `file_put_contents` data given as an array or stream is not logged.
 
+- On PHP 7 the engine does not call `zend_error_cb` when the application has a `set_error_handler` that takes the error, so those errors produce no event. PHP 8.0+ observes them regardless.
+- `unserialize` is not covered through `phar://` metadata: any file function on a phar can trigger deserialization without an event.
+
 ### Version compatibility
 
 PHP 7.3 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` for:
 - `zend_compile_string` signature (changes at 8.0 and 8.2)
-- `zend_error_cb` vs `zend_register_error_notify_callback` (changes at 8.0)
+- `zend_error_cb` vs `zend_observer_error_register` (changes at 8.0, signature again at 8.1)
 
 ### Module lifecycle
 

@@ -68,6 +68,16 @@ $hasCategory = function ($category) use ($log) {
 if (!$hasCategory('exec')) $fail('invalid mode did not keep logging');
 @unlink($log);
 
+// A fatal error bails out of the engine, so logging from it must not crash
+$fatal = '/tmp/trapbox-fatal.php';
+file_put_contents($fatal, '<?php eval("trapbox_no_such_function();");');
+@unlink($log);
+exec(escapeshellarg(PHP_BINARY) . " -dextension=$ext -dtrapbox.log_path=$log $fatal 2>&1", $fatalOutput, $fatalCode);
+if ($fatalCode !== 255) $fail("uncaught error in eval exited with $fatalCode");
+if (!$hasCategory('error') || strpos(file_get_contents($log), '"function":"E_ERROR"') === false) $fail('fatal error in eval not logged');
+@unlink($log);
+@unlink($fatal);
+
 $anyPath = PHP_BINARY . " -dextension=$ext -dtrapbox.log_path=$log";
 $write = "-r 'file_put_contents(\"/tmp/trapbox-any.txt\", \"y\");'";
 shell_exec("$anyPath $write 2>&1");

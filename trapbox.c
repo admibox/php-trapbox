@@ -350,17 +350,28 @@ void trapbox_log_event(const char *category, const char *mode, const char *funct
 
 /* ── function table interception ──────────────────────────────── */
 
-typedef struct _trapbox_intercepted {
-  zend_function func;
-  zend_function *original;
-} trapbox_intercepted;
+/*
+ * Handlers are patched once in MINIT and never restored. A per-request swap of
+ * function table entries crashes under JIT: compiled code outlives the request
+ * and keeps the pointer to the freed entry.
+ */
+typedef struct _trapbox_hook {
+  const char *name;
+  zif_handler original;
+} trapbox_hook;
 
-#define TRAPBOX_MAX_INTERCEPTS 32
-
-static const char *trapbox_exec_functions[] = {
-  "exec", "system", "shell_exec", "passthru",
-  "popen", "proc_open", "pcntl_exec", NULL
+static trapbox_hook trapbox_exec_hooks[] = {
+  {"exec", NULL}, {"system", NULL}, {"shell_exec", NULL}, {"passthru", NULL},
+  {"popen", NULL}, {"proc_open", NULL}, {"pcntl_exec", NULL}, {NULL, NULL}
 };
+
+static zif_handler trapbox_original_handler(const trapbox_hook *hooks, const char *name)
+{
+  for (const trapbox_hook *hook = hooks; hook->name; hook++) {
+    if (strcmp(hook->name, name) == 0) return hook->original;
+  }
+  return NULL;
+}
 
 static zend_string *trapbox_zstr_arg(zval *arg)
 {
@@ -373,18 +384,8 @@ static zend_string *trapbox_zstr_arg(zval *arg)
 ZEND_FUNCTION(trapbox_exec_handler)
 {
   enum trapbox_mode mode = trapbox_parse_mode(TRAPBOX_G(mode_exec));
-  if (mode == TRAPBOX_MODE_OFF) {
-    /* Call original directly */
-    trapbox_intercepted *ti = (trapbox_intercepted *)execute_data->func;
-    zend_function *orig = ti->original;
-    execute_data->func = orig;
-    orig->internal_function.handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
-    return;
-  }
-
-  trapbox_intercepted *ti = (trapbox_intercepted *)execute_data->func;
-  zend_function *orig = ti->original;
-  const char *fn_name = ZSTR_VAL(orig->common.function_name);
+  const char *fn_name = ZSTR_VAL(execute_data->func->common.function_name);
+  zif_handler original = trapbox_original_handler(trapbox_exec_hooks, fn_name);
 
   /* Collect first argument as the command string for logging */
   const char *arg_strs[1] = { "" };
@@ -408,8 +409,7 @@ ZEND_FUNCTION(trapbox_exec_handler)
   trapbox_log_event("exec", trapbox_mode_name(mode), fn_name, arg_strs, arg_lens, arg_count);
 
   if (mode == TRAPBOX_MODE_BYPASS) {
-    execute_data->func = orig;
-    orig->internal_function.handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    original(INTERNAL_FUNCTION_PARAM_PASSTHRU);
     return;
   }
 
@@ -417,57 +417,15 @@ ZEND_FUNCTION(trapbox_exec_handler)
   RETURN_FALSE;
 }
 
-static int trapbox_intercept_function(const char *name, zif_handler handler)
+static void trapbox_install_hooks(trapbox_hook *hooks, zif_handler handler)
 {
-  zend_string *zname = zend_string_init(name, strlen(name), 0);
-  zval *entry = zend_hash_find(EG(function_table), zname);
-  zend_string_release(zname);
-
-  if (!entry) return FAILURE;
-
-  zend_function *orig = Z_PTR_P(entry);
-
-  trapbox_intercepted *ti = emalloc(sizeof(trapbox_intercepted));
-  zend_function *orig_copy = emalloc(sizeof(zend_function));
-  memcpy(orig_copy, orig, sizeof(zend_function));
-  ti->original = orig_copy;
-
-  memcpy(&ti->func, orig, sizeof(zend_function));
-  ti->func.internal_function.handler = handler;
-
-  /* Store in per-request tracking array */
-  int idx = TRAPBOX_G(intercept_count);
-  if (idx >= TRAPBOX_MAX_INTERCEPTS) {
-    efree(orig_copy);
-    efree(ti);
-    return FAILURE;
-  }
-  TRAPBOX_G(intercepts)[idx] = ti;
-  TRAPBOX_G(originals)[idx] = orig;
-  TRAPBOX_G(intercept_count) = idx + 1;
-
-  /* Overwrite pointer in function table */
-  Z_PTR_P(entry) = ti;
-  return SUCCESS;
-}
-
-static void trapbox_restore_all(void)
-{
-  for (int i = 0; i < TRAPBOX_G(intercept_count); i++) {
-    trapbox_intercepted *ti = TRAPBOX_G(intercepts)[i];
-    zend_function *orig = TRAPBOX_G(originals)[i];
-
-    if (ti && orig) {
-      zend_string *name = orig->common.function_name;
-      zval *entry = zend_hash_find(EG(function_table), name);
-      if (entry && Z_PTR_P(entry) == ti) {
-        Z_PTR_P(entry) = orig;
-      }
-      efree(ti->original);
-      efree(ti);
+  for (trapbox_hook *hook = hooks; hook->name; hook++) {
+    zend_function *func = zend_hash_str_find_ptr(CG(function_table), hook->name, strlen(hook->name));
+    if (func && func->type == ZEND_INTERNAL_FUNCTION) {
+      hook->original = func->internal_function.handler;
+      func->internal_function.handler = handler;
     }
   }
-  TRAPBOX_G(intercept_count) = 0;
 }
 
 /* ── module lifecycle ─────────────────────────────────────────── */
@@ -487,6 +445,11 @@ PHP_MINIT_FUNCTION(trapbox)
   trapbox_check_mode("trapbox.secret_read", TRAPBOX_G(mode_secret_read));
   trapbox_check_mode("trapbox.unserialize", TRAPBOX_G(mode_unserialize));
   trapbox_check_mode("trapbox.errors", TRAPBOX_G(mode_errors));
+
+  /* These settings are PHP_INI_SYSTEM, so the decision holds for the whole process */
+  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
+    trapbox_install_hooks(trapbox_exec_hooks, ZEND_FN(trapbox_exec_handler));
+  }
   return SUCCESS;
 }
 
@@ -508,22 +471,11 @@ PHP_RINIT_FUNCTION(trapbox)
   TRAPBOX_G(client_ip) = NULL;
   TRAPBOX_G(server_ht) = NULL;
   TRAPBOX_G(request_body) = NULL;
-  TRAPBOX_G(intercept_count) = 0;
-
-  /* Intercept exec family */
-  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
-    for (const char **fn = trapbox_exec_functions; *fn; fn++) {
-      trapbox_intercept_function(*fn, ZEND_FN(trapbox_exec_handler));
-    }
-  }
-
   return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(trapbox)
 {
-  trapbox_restore_all();
-
   if (TRAPBOX_G(request_body)) {
     zend_string_release(TRAPBOX_G(request_body));
     TRAPBOX_G(request_body) = NULL;

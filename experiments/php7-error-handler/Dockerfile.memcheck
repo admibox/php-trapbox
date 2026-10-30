@@ -1,0 +1,5 @@
+ARG PHP_IMAGE=ecommpro/php:7.4-fpm
+FROM ${PHP_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends valgrind \
+    && rm -rf /var/lib/apt/lists/*

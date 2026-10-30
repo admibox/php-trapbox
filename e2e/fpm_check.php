@@ -24,7 +24,7 @@ unset($phar);
 file_put_contents('/tmp/trapbox-fpm-env.php', 'secret');
 file_put_contents($conf, "[global]\nerror_log=$fpmLog\ndaemonize=no\n[www]\nlisten=127.0.0.1:$port\npm=static\npm.max_children=1\ncatch_workers_output=yes\n");
 
-$flags = "-dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=$mode -dtrapbox.eval=$mode -dtrapbox.include=$mode -dtrapbox.file_write=$mode -dtrapbox.secret_read=$mode -dopcache.enable=1 -dopcache.validate_timestamps=0 -dopcache.file_update_protection=0";
+$flags = "-dextension=$ext -dtrapbox.log_path=$log -dtrapbox.max_arg_size=64 -dtrapbox.exec=$mode -dtrapbox.eval=$mode -dtrapbox.include=$mode -dtrapbox.file_write=$mode -dtrapbox.secret_read=$mode -dtrapbox.unserialize=$mode -dtrapbox.errors=$mode -dopcache.enable=1 -dopcache.validate_timestamps=0 -dopcache.file_update_protection=0";
 if (strpos((string) shell_exec('php-fpm -m'), 'Zend OPcache') === false) {
     $flags = "-dzend_extension=opcache $flags";
 }
@@ -52,8 +52,9 @@ function fcgi_post($port, $script, $body)
 
     $params = [
         'SCRIPT_FILENAME' => $script,
+        'SCRIPT_NAME' => '/' . basename($script),
         'REQUEST_METHOD' => 'POST',
-        'REQUEST_URI' => '/fpm_target.php',
+        'REQUEST_URI' => '/' . basename($script),
         'CONTENT_TYPE' => 'application/json',
         'CONTENT_LENGTH' => (string) strlen($body),
         'REMOTE_ADDR' => '192.0.2.1',
@@ -111,11 +112,24 @@ for ($i = 0; $i < $requests; $i++) {
         break;
     }
     $pids[$data['pid']] = true;
-    if ($data['ran'] !== $shouldRun || $data['evaluated'] !== $shouldRun || $data['included'] !== $shouldRun || $data['read'] !== $shouldRun || $data['wrote'] !== $shouldRun) {
+    if ($data['ran'] !== $shouldRun || $data['evaluated'] !== $shouldRun || $data['included'] !== $shouldRun || $data['read'] !== $shouldRun || $data['wrote'] !== ($shouldRun || $mode === 'trap')) {
         $fail("request $i: " . json_encode($data));
         break;
     }
+    if ($data['restored'] !== $shouldRun || $data['wakeups'] !== ($shouldRun ? 1 : 0)
+        || !$data['restricted'] || $data['scalars'] !== [42] || $data['handled'] !== 1
+        || $data['missing'] !== false || $data['handled_missing'] !== false) {
+        $fail("request $i: unserialize or error handling changed: " . json_encode($data));
+        break;
+    }
     $last = $data;
+    if ($i === 0 && $mode !== 'trap') {
+        $fatalResponse = fcgi_post($port, __DIR__ . '/fpm_fatal.php', $body);
+        if ($fatalResponse === null || strpos($fatalResponse, 'FATAL_START') === false
+            || strpos($fatalResponse, 'FATAL_AFTER') !== false) {
+            $fail('fatal request continued or did not respond: ' . var_export($fatalResponse, true));
+        }
+    }
 }
 
 proc_terminate($server);
@@ -134,24 +148,56 @@ if (preg_match('/SIG[A-Z]+|Segmentation|core dumped|exited on signal|zend_mm_hea
 }
 
 $lines = is_file($log) ? file($log, FILE_IGNORE_NEW_LINES) : [];
-// 3 exec + 3 eval + 1 include + 1 read + 1 write per request. The include count proves OPcache does not hide cached phars.
-$expected = $mode === 'off' ? 0 : $requests * 9;
+// Assert counts by category per request, including warnings handled by the application.
+$categoryCounts = ['exec' => 3, 'eval' => 3, 'include' => 1, 'secret_read' => 1,
+    'file_write' => 1, 'unserialize' => 1, 'error' => 2];
+$fatalCounts = $mode === 'bypass' ? ['eval' => 1, 'error' => 1]
+    : ($mode === 'block' ? ['include' => 1] : []);
+$expected = $mode === 'off' ? 0 : $requests * array_sum($categoryCounts) + array_sum($fatalCounts);
 if (count($lines) !== $expected) $fail('expected ' . $expected . ' events, got ' . count($lines));
 
 $rids = [];
+$fatalRids = [];
 foreach ($lines as $line) {
     $event = json_decode($line, true);
     if (!is_array($event)) {
         $fail("invalid JSON: $line");
         break;
     }
-    $rids[$event['rid']] = true;
+    $isFatal = ($event['request']['uri'] ?? '') === '/fpm_fatal.php';
+    if ($isFatal) $fatalRids[$event['rid']] = true;
+    $rid = $event['rid'];
+    $category = $event['category'];
+    $rids[$rid][$category] = ($rids[$rid][$category] ?? 0) + 1;
+    if ($category === 'unserialize' && (($event['args'][0] ?? '') !== 'O:19:"FpmUnserializeProbe":0:{}'
+        || ($event['mode'] ?? '') !== $mode)) $fail('wrong unserialize event');
+    if ($isFatal && $category === 'error' && ($event['function'] ?? '') !== 'E_ERROR') $fail('fatal error has wrong severity');
+    if (!$isFatal && $category === 'error' && (($event['function'] ?? '') !== 'E_WARNING'
+        || ($event['mode'] ?? '') !== 'bypass'
+        || strpos($event['args'][0] ?? '', '/nonexistent-trapbox/') === false)) $fail('wrong error event');
+    if (!$isFatal && in_array($category, ['error', 'unserialize'], true)
+        && basename($event['backtrace'][0]['file'] ?? '') !== 'fpm_target.php') $fail('wrong event origin');
+    if (!$isFatal && in_array($event['category'], ['exec', 'eval'], true)) {
+        $args = $event['backtrace'][0]['args'] ?? [];
+        if ($args !== ['echo trapbox_marker', ['type' => 'array'], ['type' => 'object'], str_repeat('x', 64) . '...[truncated]']) {
+            $fail('wrong backtrace arguments: ' . $line);
+            break;
+        }
+    }
+
     if (($event['request']['body'] ?? null) !== $body || ($event['request']['ip'] ?? null) !== '192.0.2.1') {
         $fail('wrong request context: ' . $line);
         break;
     }
 }
-if ($mode !== 'off' && count($rids) !== $requests) $fail('expected one rid per request, got ' . count($rids));
+if ($mode !== 'off' && count($rids) !== $requests + ($fatalCounts ? 1 : 0)) $fail('expected one rid per request, got ' . count($rids));
+
+foreach ($rids as $rid => $counts) {
+    ksort($counts);
+    $expectedCounts = isset($fatalRids[$rid]) ? $fatalCounts : $categoryCounts;
+    ksort($expectedCounts);
+    if ($counts !== $expectedCounts) $fail('wrong categories in request: ' . json_encode($counts));
+}
 
 @unlink($log);
 if ($failed) {

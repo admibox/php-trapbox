@@ -58,8 +58,8 @@ restore_error_handler();
 
 if ($handled !== 1) $fail('the application error handler was not called');
 $events = $errorEvents();
-// PHP 7 does not call zend_error_cb when a user handler takes the error
-$expected = ($mode === 'off' || PHP_VERSION_ID < 80000) ? 0 : 1;
+// PHP 7 wraps the callback; PHP 8 observes the error directly.
+$expected = $mode === 'off' ? 0 : 1;
 if (count($events) !== $expected) $fail("with a user handler expected $expected events, got " . count($events));
 
 @unlink($log);

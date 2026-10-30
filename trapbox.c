@@ -92,8 +92,28 @@ static void trapbox_check_mode(const char *setting, const char *value)
 
 #define TRAPBOX_RID_LEN 12
 
+#ifdef ZTS
+static uint64_t trapbox_rid_sequence;
+static uint64_t trapbox_rid_salt;
+#endif
+
 static void trapbox_generate_rid(char *buf)
 {
+#ifdef ZTS
+  /* Threads can start requests in the same microsecond. An atomic sequence
+   * and an odd multiplier give distinct 48-bit IDs within a process until
+   * the sequence wraps at 2^48; PID and startup time distinguish processes.
+   * This is a correlation identifier, not a cryptographic token. */
+  uint64_t sequence = __sync_add_and_fetch(&trapbox_rid_sequence, 1);
+  uint64_t value = sequence * UINT64_C(0x9e3779b97f4a7c15)
+    + trapbox_rid_salt + ((uint64_t)getpid() << 16);
+  static const char hex[] = "0123456789abcdef";
+  for (int i = 0; i < TRAPBOX_RID_LEN; i++) {
+    buf[TRAPBOX_RID_LEN - 1 - i] = hex[value & 15];
+    value >>= 4;
+  }
+  buf[TRAPBOX_RID_LEN] = '\0';
+#else
   struct timeval tv;
   gettimeofday(&tv, NULL);
 
@@ -106,15 +126,15 @@ static void trapbox_generate_rid(char *buf)
     buf[i] = hex[(seed >> 32) & 0xf];
   }
   buf[TRAPBOX_RID_LEN] = '\0';
+#endif
 }
 
 /* ── json helpers ─────────────────────────────────────────────── */
 
 static void trapbox_json_append_escaped(smart_str *buf, const char *str, size_t len, size_t max_len)
 {
-  if (max_len > 0 && len > max_len) {
-    len = max_len;
-  }
+  zend_bool truncated = max_len > 0 && len > max_len;
+  if (truncated) len = max_len;
   for (size_t i = 0; i < len; i++) {
     unsigned char c = (unsigned char)str[i];
     switch (c) {
@@ -134,6 +154,7 @@ static void trapbox_json_append_escaped(smart_str *buf, const char *str, size_t 
         }
     }
   }
+  if (truncated) smart_str_appends(buf, "...[truncated]");
 }
 
 static void trapbox_json_key_str(smart_str *buf, const char *key, const char *val, size_t val_len, size_t max_len)
@@ -182,7 +203,9 @@ static void trapbox_capture_request(void)
   /* Request body from php://input */
   php_stream *stream = php_stream_open_wrapper("php://input", "rb", REPORT_ERRORS, NULL);
   if (stream) {
-    zend_string *body = php_stream_copy_to_mem(stream, TRAPBOX_G(max_body_size), 0);
+    zend_string *body = php_stream_copy_to_mem(stream,
+      TRAPBOX_G(max_body_size) > 0 && TRAPBOX_G(max_body_size) < ZEND_LONG_MAX
+        ? (size_t)TRAPBOX_G(max_body_size) + 1 : PHP_STREAM_COPY_ALL, 0);
     php_stream_close(stream);
     if (body) {
       TRAPBOX_G(request_body) = body;
@@ -191,6 +214,38 @@ static void trapbox_capture_request(void)
 }
 
 /* ── backtrace capture ────────────────────────────────────────── */
+
+/* Never convert objects or traverse containers: logging must not execute user code. */
+static void trapbox_append_argument(smart_str *buf, zval *value)
+{
+  ZVAL_DEREF(value);
+  switch (Z_TYPE_P(value)) {
+    case IS_NULL: smart_str_appends(buf, "null"); return;
+    case IS_TRUE: smart_str_appends(buf, "true"); return;
+    case IS_FALSE: smart_str_appends(buf, "false"); return;
+    case IS_LONG: smart_str_append_long(buf, Z_LVAL_P(value)); return;
+    case IS_STRING:
+      smart_str_appendc(buf, '"');
+      trapbox_json_append_escaped(buf, Z_STRVAL_P(value), Z_STRLEN_P(value),
+        TRAPBOX_G(max_arg_size) > 0 ? (size_t)TRAPBOX_G(max_arg_size) : 0);
+      smart_str_appendc(buf, '"');
+      return;
+    case IS_DOUBLE: {
+      /* Zend's scalar formatter handles precision without invoking user code.
+       * Keep non-finite values valid JSON by representing floats as typed strings. */
+      zend_string *number = zval_get_string(value);
+      smart_str_appends(buf, "{\"type\":\"float\",");
+      trapbox_json_key_str(buf, "value", ZSTR_VAL(number), ZSTR_LEN(number), 0);
+      smart_str_appendc(buf, '}');
+      zend_string_release(number);
+      return;
+    }
+    case IS_ARRAY: smart_str_appends(buf, "{\"type\":\"array\"}"); return;
+    case IS_OBJECT: smart_str_appends(buf, "{\"type\":\"object\"}"); return;
+    case IS_RESOURCE: smart_str_appends(buf, "{\"type\":\"resource\"}"); return;
+    default: smart_str_appends(buf, "{\"type\":\"unavailable\"}"); return;
+  }
+}
 
 static void trapbox_append_backtrace(smart_str *buf)
 {
@@ -219,6 +274,19 @@ static void trapbox_append_backtrace(smart_str *buf)
     const char *fn = frame->func->common.function_name
       ? ZSTR_VAL(frame->func->common.function_name) : "{main}";
     trapbox_json_key_str(buf, "function", fn, strlen(fn), 0);
+
+    smart_str_appends(buf, ",\"args\":[");
+    /* Main/include frames have no argument slots. Extra user arguments live
+     * after compiled variables and temporaries, not after declared arguments. */
+    uint32_t count = frame->func->common.function_name ? ZEND_CALL_NUM_ARGS(frame) : 0;
+    uint32_t declared = frame->func->op_array.num_args;
+    for (uint32_t i = 0; i < count; i++) {
+      if (i) smart_str_appendc(buf, ',');
+      zval *arg = i < declared ? ZEND_CALL_ARG(frame, i + 1)
+        : ZEND_CALL_VAR_NUM(frame, frame->func->op_array.last_var + frame->func->op_array.T + i - declared);
+      trapbox_append_argument(buf, arg);
+    }
+    smart_str_appendc(buf, ']');
 
     smart_str_appendc(buf, '}');
     frame = frame->prev_execute_data;
@@ -494,6 +562,9 @@ static zend_op_array *trapbox_compile_string(zval *source, char *filename)
 /* ── include interception (zend_compile_file) ─────────────────── */
 
 static zend_op_array *(*trapbox_prev_compile_file)(zend_file_handle *file_handle, int type) = NULL;
+#ifdef ZTS
+static MUTEX_T trapbox_compile_file_mutex;
+#endif
 
 /* Any stream wrapper except file://, so wrappers we did not think of are still caught */
 static int trapbox_is_wrapper_path(const char *path)
@@ -542,8 +613,18 @@ static zend_op_array *trapbox_compile_file(zend_file_handle *file_handle, int ty
   size_t arg_lens[1] = { strlen(filename) };
   trapbox_log_event("include", trapbox_mode_name(mode), "include", arg_strs, arg_lens, 1);
 
-  /* include evaluates to false on block. require does not halt: the caller sees false too */
-  if (mode == TRAPBOX_MODE_BLOCK) return NULL;
+  /* Preserve the engine's required-dependency failure behavior: fatal in PHP 7,
+   * catchable Error in PHP 8. The interception event has already been written. */
+  if (mode == TRAPBOX_MODE_BLOCK) {
+    if (type == ZEND_REQUIRE || type == ZEND_REQUIRE_ONCE) {
+#if PHP_VERSION_ID >= 80000
+      zend_throw_error(NULL, "trapbox blocked required file '%s'", filename);
+#else
+      zend_error(E_ERROR, "trapbox blocked required file '%s'", filename);
+#endif
+    }
+    return NULL;
+  }
   /* trap mimics a successful include of a file with no return statement */
   if (mode == TRAPBOX_MODE_TRAP) return trapbox_compile_trap(filename);
   return trapbox_prev_compile_file(file_handle, type);
@@ -947,6 +1028,213 @@ static void trapbox_on_error(int type, const char *filename, uint32_t lineno, co
   TRAPBOX_G(in_error) = 0;
 }
 
+/* PHP 7 user error handlers: observe warnings before forwarding to Zend. */
+#if PHP_VERSION_ID < 80000
+#include "zend_exceptions.h"
+
+typedef struct trapbox_error_proxy {
+  zval callback;
+  zend_internal_function invoke;
+  struct trapbox_error_proxy *abandoned_next;
+  uint32_t abandoned_refs;
+  zend_object object;
+} trapbox_error_proxy;
+
+static zend_class_entry *trapbox_error_proxy_ce;
+static zend_internal_function trapbox_proxy_invoke_template;
+static zend_object_handlers trapbox_error_proxy_handlers;
+static zif_handler trapbox_original_set_error_handler;
+
+static trapbox_error_proxy *trapbox_proxy_from_object(zend_object *object)
+{
+  return (trapbox_error_proxy *)((char *)object - XtOffsetOf(trapbox_error_proxy, object));
+}
+
+static zend_object *trapbox_proxy_create(zend_class_entry *ce)
+{
+  trapbox_error_proxy *proxy = ecalloc(1, sizeof(*proxy) + zend_object_properties_size(ce));
+  ZVAL_UNDEF(&proxy->callback);
+  memcpy(&proxy->invoke, &trapbox_proxy_invoke_template, sizeof(proxy->invoke));
+  zend_object_std_init(&proxy->object, ce);
+  object_properties_init(&proxy->object, ce);
+  proxy->object.handlers = &trapbox_error_proxy_handlers;
+  return &proxy->object;
+}
+
+static void trapbox_proxy_free(zend_object *object)
+{
+  trapbox_error_proxy *proxy = trapbox_proxy_from_object(object);
+  zval_ptr_dtor(&proxy->callback);
+  zend_object_std_dtor(object);
+}
+
+static HashTable *trapbox_proxy_gc(zval *value, zval **table, int *count)
+{
+  trapbox_error_proxy *proxy = trapbox_proxy_from_object(Z_OBJ_P(value));
+  *table = &proxy->callback;
+  *count = 1;
+  return zend_std_get_properties(value);
+}
+
+static void trapbox_proxy_clear_pending(void)
+{
+  if (TRAPBOX_G(proxy_pending_message)) zend_string_release(TRAPBOX_G(proxy_pending_message));
+  if (TRAPBOX_G(proxy_pending_file)) zend_string_release(TRAPBOX_G(proxy_pending_file));
+  TRAPBOX_G(proxy_pending_message) = NULL;
+  TRAPBOX_G(proxy_pending_file) = NULL;
+}
+
+static void trapbox_proxy_release_abandoned(void)
+{
+  /* zend_error() keeps its original handler in a C local while dispatching.
+   * A bailout skips that local's cleanup. Release only those abandoned refs
+   * after user shutdown callbacks/destructors, when no PHP call frame can
+   * resume using the proxy's embedded internal function descriptor. */
+  while (TRAPBOX_G(proxy_abandoned)) {
+    trapbox_error_proxy *proxy = TRAPBOX_G(proxy_abandoned);
+    uint32_t references = proxy->abandoned_refs;
+    TRAPBOX_G(proxy_abandoned) = proxy->abandoned_next;
+    proxy->abandoned_refs = 0;
+    proxy->abandoned_next = NULL;
+    while (references--) OBJ_RELEASE(&proxy->object);
+  }
+}
+
+static int trapbox_proxy_consume_pending(int type, const char *filename, uint32_t line, const char *message)
+{
+  if (!TRAPBOX_G(proxy_pending_message) || !TRAPBOX_G(proxy_pending_file)) return 0;
+  if (TRAPBOX_G(proxy_pending_type) != type || TRAPBOX_G(proxy_pending_line) != line
+      || strcmp(ZSTR_VAL(TRAPBOX_G(proxy_pending_message)), message) != 0
+      || strcmp(ZSTR_VAL(TRAPBOX_G(proxy_pending_file)), filename ? filename : "") != 0) return 0;
+  trapbox_proxy_clear_pending();
+  return 1;
+}
+
+/* A callable object may return an internal function through get_closure.
+ * No class scope or bound object is attached to this dispatch frame, so Zend
+ * resolves visibility, self/static and $this from the original error context.
+ * The engine's orig_user_error_handler zval owns the proxy throughout dispatch.
+ * No callback is pre-resolved and no visibility check is bypassed. */
+static int trapbox_proxy_get_closure(zval *value, zend_class_entry **scope,
+                                   zend_function **function, zend_object **object)
+{
+  trapbox_error_proxy *proxy = trapbox_proxy_from_object(Z_OBJ_P(value));
+  /* Only wrappers populated by the setter are callable. In particular, a
+   * user-created empty object must not expose the embedded function to
+   * Closure::fromCallable(), which copies internal function descriptors. */
+  if (Z_ISUNDEF(proxy->callback)) return FAILURE;
+  *scope = NULL;
+  *object = NULL;
+  *function = (zend_function *)&proxy->invoke;
+  return SUCCESS;
+}
+
+ZEND_METHOD(TrapboxErrorProxy, __invoke)
+{
+  trapbox_error_proxy *proxy = execute_data->func->common.scope == trapbox_error_proxy_ce
+    ? trapbox_proxy_from_object(Z_OBJ_P(getThis()))
+    : (trapbox_error_proxy *)((char *)execute_data->func - XtOffsetOf(trapbox_error_proxy, invoke));
+  if (Z_ISUNDEF(proxy->callback)) RETURN_FALSE;
+  uint32_t count = ZEND_NUM_ARGS();
+  /* Borrow the argument vector owned by this Zend call frame. The forwarding
+   * API uses no_separation=1 and copies arguments into the callee frame. An
+   * extra heap vector/refcount copy here leaks when user code calls exit(),
+   * because bailout skips C cleanup. Keeping ownership in Zend avoids it. */
+  zval *args = ZEND_CALL_ARG(execute_data, 1);
+  zend_bool valid = count >= 4 && Z_TYPE(args[0]) == IS_LONG
+    && Z_TYPE(args[1]) == IS_STRING && Z_TYPE(args[2]) == IS_STRING && Z_TYPE(args[3]) == IS_LONG;
+  if (valid) {
+    trapbox_on_error((int)Z_LVAL(args[0]), Z_STRVAL(args[2]), (uint32_t)Z_LVAL(args[3]), Z_STRVAL(args[1]));
+  }
+  /* Let the engine keep its recursion suppression and handler stack. Preserve
+   * the callback's value and exception instead of emulating its behavior. */
+  int result;
+  zend_try {
+    result = call_user_function(EG(function_table), NULL, &proxy->callback, return_value, count, args);
+  } zend_catch {
+    if (proxy->abandoned_refs++ == 0) {
+      proxy->abandoned_next = TRAPBOX_G(proxy_abandoned);
+      TRAPBOX_G(proxy_abandoned) = proxy;
+    }
+    zend_bailout();
+  } zend_end_try();
+  /* A failed native callback lookup falls back to zend_error_cb. Delegation
+   * failure must keep that behavior even though this dispatch call succeeded. */
+  if (result == FAILURE && !EG(exception)) ZVAL_FALSE(return_value);
+  if (valid && !EG(exception) && Z_TYPE_P(return_value) == IS_FALSE) {
+    trapbox_proxy_clear_pending();
+    TRAPBOX_G(proxy_pending_type) = (int)Z_LVAL(args[0]);
+    TRAPBOX_G(proxy_pending_line) = (uint32_t)Z_LVAL(args[3]);
+    TRAPBOX_G(proxy_pending_message) = zend_string_copy(Z_STR(args[1]));
+    TRAPBOX_G(proxy_pending_file) = zend_string_copy(Z_STR(args[2]));
+  }
+}
+
+ZEND_BEGIN_ARG_INFO_EX(trapbox_proxy_arginfo, 0, 0, 0)
+  ZEND_ARG_VARIADIC_INFO(0, arguments)
+ZEND_END_ARG_INFO()
+
+static const zend_function_entry trapbox_proxy_methods[] = {
+  ZEND_ME(TrapboxErrorProxy, __invoke, trapbox_proxy_arginfo, ZEND_ACC_PUBLIC)
+  PHP_FE_END
+};
+
+static int trapbox_is_proxy(zval *value)
+{
+  return Z_TYPE_P(value) == IS_OBJECT && Z_OBJCE_P(value) == trapbox_error_proxy_ce;
+}
+
+static ZEND_FUNCTION(trapbox_proxy_set_error_handler)
+{
+  trapbox_original_set_error_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+  /* The native return value may reference a wrapper held by its native stack. */
+  if (trapbox_is_proxy(return_value)) {
+    zval original;
+    ZVAL_COPY(&original, &trapbox_proxy_from_object(Z_OBJ_P(return_value))->callback);
+    zval_ptr_dtor(return_value);
+    ZVAL_COPY_VALUE(return_value, &original);
+  }
+  if (EG(exception) || Z_TYPE(EG(user_error_handler)) == IS_UNDEF
+      || trapbox_is_proxy(&EG(user_error_handler))) return;
+  zval wrapper;
+  object_init_ex(&wrapper, trapbox_error_proxy_ce);
+  trapbox_error_proxy *proxy = trapbox_proxy_from_object(Z_OBJ(wrapper));
+  ZVAL_COPY_VALUE(&proxy->callback, &EG(user_error_handler));
+  ZVAL_COPY_VALUE(&EG(user_error_handler), &wrapper);
+}
+
+static void trapbox_proxy_install(void)
+{
+  zend_class_entry ce;
+  INIT_CLASS_ENTRY(ce, "TrapboxErrorProxy", trapbox_proxy_methods);
+  trapbox_error_proxy_ce = zend_register_internal_class(&ce);
+  trapbox_error_proxy_ce->create_object = trapbox_proxy_create;
+  trapbox_error_proxy_ce->ce_flags |= ZEND_ACC_FINAL;
+  zend_function *invoke = zend_hash_str_find_ptr(&trapbox_error_proxy_ce->function_table,
+    "__invoke", sizeof("__invoke") - 1);
+  memcpy(&trapbox_proxy_invoke_template, &invoke->internal_function, sizeof(trapbox_proxy_invoke_template));
+  trapbox_proxy_invoke_template.scope = NULL;
+  trapbox_proxy_invoke_template.fn_flags |= ZEND_ACC_STATIC;
+  trapbox_proxy_invoke_template.function_name = zend_string_init("trapbox_error_proxy", sizeof("trapbox_error_proxy") - 1, 1);
+  memcpy(&trapbox_error_proxy_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+  trapbox_error_proxy_handlers.offset = XtOffsetOf(trapbox_error_proxy, object);
+  trapbox_error_proxy_handlers.free_obj = trapbox_proxy_free;
+  trapbox_error_proxy_handlers.get_gc = trapbox_proxy_gc;
+  trapbox_error_proxy_handlers.clone_obj = NULL;
+  trapbox_error_proxy_handlers.get_closure = trapbox_proxy_get_closure;
+  zend_function *function = zend_hash_str_find_ptr(CG(function_table), "set_error_handler", sizeof("set_error_handler") - 1);
+  trapbox_original_set_error_handler = function->internal_function.handler;
+  function->internal_function.handler = ZEND_FN(trapbox_proxy_set_error_handler);
+}
+static void trapbox_proxy_shutdown(void)
+{
+  if (trapbox_proxy_invoke_template.function_name) {
+    zend_string_release_ex(trapbox_proxy_invoke_template.function_name, 1);
+    trapbox_proxy_invoke_template.function_name = NULL;
+  }
+}
+#endif
+
 #if PHP_VERSION_ID >= 80100
 static void trapbox_error_observer(int type, zend_string *filename, uint32_t lineno, zend_string *message)
 {
@@ -971,7 +1259,8 @@ static void trapbox_error_cb(int type, const char *filename, const uint32_t line
     va_copy(copy, args);
     vspprintf(&message, 0, format, copy);
     va_end(copy);
-    trapbox_on_error(type, filename, lineno, message);
+    if (!trapbox_proxy_consume_pending(type, filename, lineno, message))
+      trapbox_on_error(type, filename, lineno, message);
     efree(message);
   }
   trapbox_prev_error_cb(type, filename, lineno, format, args);
@@ -997,6 +1286,14 @@ static const zend_function_entry trapbox_functions[] = {
 
 PHP_MINIT_FUNCTION(trapbox)
 {
+#ifdef ZTS
+  struct timeval startup;
+  gettimeofday(&startup, NULL);
+  trapbox_rid_salt = (uint64_t)startup.tv_sec * UINT64_C(1000000) + startup.tv_usec;
+  trapbox_rid_sequence = 0;
+  trapbox_compile_file_mutex = tsrm_mutex_alloc();
+#endif
+  trapbox_prev_compile_file = NULL;
   ZEND_INIT_MODULE_GLOBALS(trapbox, php_trapbox_init_globals, NULL);
   REGISTER_INI_ENTRIES();
   trapbox_check_mode("trapbox.exec", TRAPBOX_G(mode_exec));
@@ -1030,6 +1327,7 @@ PHP_MINIT_FUNCTION(trapbox)
 #else
     trapbox_prev_error_cb = zend_error_cb;
     zend_error_cb = trapbox_error_cb;
+    trapbox_proxy_install();
 #endif
   }
 
@@ -1048,11 +1346,17 @@ PHP_MSHUTDOWN_FUNCTION(trapbox)
   if (zend_compile_file == trapbox_compile_file) {
     zend_compile_file = trapbox_prev_compile_file;
   }
+#ifdef ZTS
+  tsrm_mutex_free(trapbox_compile_file_mutex);
+#endif
 #if PHP_VERSION_ID < 80000
   if (zend_error_cb == trapbox_error_cb) {
     zend_error_cb = trapbox_prev_error_cb;
   }
 #endif
+  #if PHP_VERSION_ID < 80000
+  trapbox_proxy_shutdown();
+  #endif
   trapbox_errors_enabled = 0;
   trapbox_list_free(&trapbox_write_extensions);
   trapbox_list_free(&trapbox_secret_paths);
@@ -1076,18 +1380,30 @@ PHP_RINIT_FUNCTION(trapbox)
   TRAPBOX_G(in_request) = 1;
 
   /* Installed here rather than in MINIT: OPcache hooks after MINIT and would sit in front,
-     hiding cached phar:// includes. Runs once per process. */
+     hiding cached phar:// includes. Runs once per process. Serialize the check
+     and installation in ZTS, or another first request can capture this hook
+     as its own predecessor and recurse indefinitely. */
+#ifdef ZTS
+  tsrm_mutex_lock(trapbox_compile_file_mutex);
+#endif
   if (!trapbox_prev_compile_file && TRAPBOX_G(enabled)
       && trapbox_parse_mode(TRAPBOX_G(mode_include)) != TRAPBOX_MODE_OFF) {
     trapbox_prev_compile_file = zend_compile_file;
     zend_compile_file = trapbox_compile_file;
   }
+#ifdef ZTS
+  tsrm_mutex_unlock(trapbox_compile_file_mutex);
+#endif
   return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(trapbox)
 {
   TRAPBOX_G(in_request) = 0;
+#if PHP_VERSION_ID < 80000
+  trapbox_proxy_clear_pending();
+  trapbox_proxy_release_abandoned();
+#endif
   if (TRAPBOX_G(request_body)) {
     zend_string_release(TRAPBOX_G(request_body));
     TRAPBOX_G(request_body) = NULL;

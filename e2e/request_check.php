@@ -9,7 +9,7 @@ $fail = function ($msg) use (&$failed) { echo "FAIL: request: $msg\n"; $failed =
 
 @unlink($log);
 
-$command = escapeshellarg(PHP_BINARY) . " -dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=block -S 127.0.0.1:$port -t " . escapeshellarg(__DIR__);
+$command = escapeshellarg(PHP_BINARY) . " -dextension=$ext -dtrapbox.log_path=$log -dtrapbox.exec=block -dtrapbox.max_body_size=32 -dtrapbox.max_arg_size=64 -S 127.0.0.1:$port -t " . escapeshellarg(__DIR__);
 $server = proc_open(
     "exec $command",
     [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
@@ -32,6 +32,14 @@ $response = @file_get_contents("http://127.0.0.1:$port/request_target.php?a=1", 
     'content' => $body,
 ]]));
 
+foreach ([32, 33] as $length) {
+    file_get_contents("http://127.0.0.1:$port/request_target.php", false, stream_context_create(['http' => [
+        'method' => 'POST',
+        'header' => 'X-Long: ' . str_repeat('h', $length * 2) . "\r\n",
+        'content' => str_repeat('b', $length),
+    ]]));
+}
+
 proc_terminate($server);
 proc_close($server);
 
@@ -39,8 +47,8 @@ if ($response === false) $fail('no response from server');
 if (strpos((string) $response, 'trapbox_marker') !== false) $fail('command ran in block mode');
 
 $lines = is_file($log) ? file($log, FILE_IGNORE_NEW_LINES) : [];
-if (count($lines) !== 1) {
-    $fail('expected 1 event, got ' . count($lines));
+if (count($lines) !== 3) {
+    $fail('expected 3 events, got ' . count($lines));
 } else {
     $event = json_decode($lines[0], true);
     if (!is_array($event)) {
@@ -55,6 +63,12 @@ if (count($lines) !== 1) {
         if (isset($request['headers']['cookie']) || isset($request['headers']['authorization'])) $fail('credentials logged');
         if (($request['body'] ?? null) !== '{"query":"mutation \"x\""}' . "\u{00ff}\u{0000}") $fail('body not preserved: ' . json_encode($request['body'] ?? null));
     }
+}
+foreach ([1 => false, 2 => true] as $index => $truncated) {
+    $boundary = json_decode($lines[$index] ?? '', true);
+    $marker = $truncated ? '...[truncated]' : '';
+    if (($boundary['request']['body'] ?? null) !== str_repeat('b', 32) . $marker) $fail('body truncation boundary');
+    if (($boundary['request']['headers']['x-long'] ?? null) !== str_repeat('h', 64) . $marker) $fail('header truncation boundary');
 }
 @unlink($log);
 

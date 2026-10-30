@@ -26,6 +26,13 @@ ZEND_BEGIN_MODULE_GLOBALS(trapbox)
   zend_long max_arg_size;
   zend_long max_body_size;
 
+  /* PHP 7 callback cleanup and fallback deduplication, request-local. */
+  void *proxy_abandoned;
+  zend_string *proxy_pending_message;
+  zend_string *proxy_pending_file;
+  int proxy_pending_type;
+  uint32_t proxy_pending_line;
+
   /* per-request state */
   char rid[13];
   int request_captured;

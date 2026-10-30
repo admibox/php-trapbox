@@ -1,31 +1,14 @@
 #!/bin/bash
 #
-# Test trapbox extension across multiple PHP versions using Docker
+# Test trapbox extension across multiple PHP versions using nerdctl
 #
 
 set -e
 
-# Auto-detect container runtime
-if command -v docker &>/dev/null; then
-    RUNTIME="docker"
-elif command -v nerdctl &>/dev/null; then
-    # Check if nerdctl works without sudo (rootless) or needs sudo
-    if nerdctl info &>/dev/null 2>&1; then
-        RUNTIME="nerdctl"
-    elif sudo nerdctl info &>/dev/null 2>&1; then
-        RUNTIME="sudo nerdctl"
-    else
-        echo "Error: nerdctl found but not functional (rootless or with sudo)"
-        exit 1
-    fi
-else
-    echo "Error: No container runtime found (docker or nerdctl)"
-    exit 1
-fi
-echo "Using container runtime: $RUNTIME"
-
-VERSIONS=("7.3" "7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/test-config.sh"
+echo "Using container runtime: ${RUNTIME[*]}"
+
 FAILED=()
 PASSED=()
 
@@ -42,10 +25,10 @@ echo "=========================================="
 # Clean up stale build files
 rm -f "$SCRIPT_DIR/trapbox.dep" 2>/dev/null
 
-for VERSION in "${VERSIONS[@]}"; do
+for VERSION in "${PHP_VERSIONS[@]}"; do
     echo -e "\n${YELLOW}Testing PHP $VERSION...${NC}"
 
-    if OUTPUT=$($RUNTIME run --rm -v "$SCRIPT_DIR:/ext" -w /ext "php:$VERSION-cli" sh -c '
+    if OUTPUT=$("${RUNTIME[@]}" run --rm --entrypoint sh -v "$SCRIPT_DIR:/ext" -w /ext "$IMAGE_REPOSITORY:$VERSION-cli$IMAGE_TAG_SUFFIX" -c '
         make clean >/dev/null 2>&1
         phpize --clean >/dev/null 2>&1
         phpize >/dev/null 2>&1 && \
@@ -64,6 +47,7 @@ for VERSION in "${VERSIONS[@]}"; do
             done
         done
         php e2e/request_check.php 2>&1 || exit 1
+        php -dphar.readonly=0 e2e/include_check.php 2>&1 || exit 1
     ' 2>&1); then
         echo -e "${GREEN}PHP $VERSION: PASSED${NC}"
         PASSED+=("$VERSION")

@@ -1,39 +1,20 @@
 <?php
-var_dump(function_exists('trapbox_intercept'));
+// Main test runner: includes all test_*.php files.
+// Each test prints "OK: ..." on success or "FAIL: ..." on failure.
+// Exit code 0 = no failures found in output.
 
-trapbox_intercept('file_put_contents', function ($original, $filename, $content = null, $flags = null) {
-    $ext = pathinfo($filename, PATHINFO_EXTENSION);
-    if ($ext === 'php') {
-        file_put_contents('./audit.log', "Hack attempt!\n", FILE_APPEND);
-        return true;
-    }
-    return $original($filename, $content, $flags);
-});
+$dir = __DIR__;
+$tests = glob("$dir/test_*.php");
+$output = '';
 
-trapbox_intercept('get_loaded_extensions', function ($original) {
-    return array_filter($original(), function($item) { return $item !== 'trapbox'; });
-});
-
-trapbox_intercept('extension_loaded', function ($original, $extension = null) {
-    return $extension === 'trapbox' ? false : $original($extension);
-});
-
-trapbox_intercept('phpinfo', function ($original, $flags = INFO_ALL) {
+foreach ($tests as $test) {
     ob_start();
-    $original($flags);
+    include $test;
+    $output .= ob_get_clean();
+}
 
-    echo implode(PHP_EOL, array_filter(explode(PHP_EOL, ob_get_clean()), function($line) {
-        return strpos($line, 'trapbox') === false;
-    }));
-});
+echo $output;
 
-trapbox_seal();
-
-var_dump(function_exists('trapbox_intercept'));
-
-var_dump(file_put_contents('app.php', '<?php echo "This is a hack"'));
-
-print_r(get_loaded_extensions());
-var_dump(extension_loaded('trapbox'));
-
-//phpinfo();
+if (strpos($output, 'FAIL') !== false) {
+    exit(1);
+}

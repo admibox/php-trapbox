@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-php-trapbox is a PHP extension that enables runtime function interception using closures. It allows replacing any PHP function with a custom handler that receives the original function as a callable plus all arguments. The extension includes stealth features to hide itself from PHP introspection and a seal mechanism to prevent further modifications.
+trapbox is a PHP C extension for intrusion detection. It intercepts dangerous PHP functions (`exec`, `eval`, `include`, file writes to code paths, secret file reads, `unserialize`) and logs events with full backtrace, request context, and correlation ID. Three modes per category: **block** (prevent), **trap** (fake success, capture payload), **bypass** (allow, observe).
+
+Design plan: https://claude.ai/artifact/Kb9CCqtKc8ntrSQgEyCyBi
 
 ## Build Commands
 
@@ -14,83 +16,46 @@ make clean && phpize && ./configure && make
 
 # Quick rebuild after code changes
 make
-
-# Install to PHP extension directory
-make install
 ```
 
 ## Running Tests
 
 ```bash
-# Run main test (build + test)
-./test.sh
-
-# Test across all PHP versions (7.4, 8.0-8.5) using Docker
+# Test across all PHP versions (7.4, 8.0-8.5) via containers
 ./test-versions.sh
 
-# Run tests manually
+# Run tests manually (requires extension built for this PHP version)
 php -dextension=modules/trapbox.so test.php
-php -dextension=modules/trapbox.so test2.php
 ```
+
+Tests use `sudo nerdctl` (not docker). `test-versions.sh` auto-detects the container runtime.
+
+`test.php` is the runner — it includes all `test_*.php` files. Each test prints `OK:` or `FAIL:` lines. Add new tests as `test_<name>.php`.
 
 ## Architecture
 
-### Core Data Structures
+Single source file: `trapbox.c`. Header: `php_trapbox.h`.
 
-- `replaced_functions` (HashTable): Maps function names to original `zend_function` pointers
-- `closures` (HashTable): Maps function names to replacement closure zvals
-- `intercepted_function` struct: Wraps original function with replacement handler
-- `internal_call_context` (thread-local int): Tracks nested calls to prevent infinite recursion
+### Hook mechanisms (planned, see design plan)
 
-### Function Interception Flow
+| Category | Hook |
+|---|---|
+| exec family | Function table replacement in `EG(function_table)` |
+| eval | `zend_compile_string` (global fn pointer swap) |
+| include/require | `zend_compile_file` (global fn pointer swap, chains after OPcache) |
+| File writes/reads | Function table replacement + argument filtering |
+| unserialize | Function table replacement |
+| Errors/warnings | `zend_error_cb` (7.x) / `zend_register_error_notify_callback` (8.0+) |
 
-1. `trapbox_intercept()` stores original function and closure in hash tables
-2. Creates `intercepted_function` struct pointing to original function
-3. Replaces function handler with `ZEND_FN(replacement_function)`
-4. On call, `replacement_function` checks `internal_call_context`:
-   - If > 0 (nested/internal call): calls original directly
-   - If 0 (normal call): wraps original as closure, calls user's handler with `($original, ...$args)`
+### Version compatibility
 
-### Module Lifecycle
+PHP 7.4 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` for:
+- `zend_compile_string` signature (changes at 8.0 and 8.2)
+- `zend_error_cb` vs `zend_register_error_notify_callback` (changes at 8.0)
 
-- **MINIT**: Initialize hash tables, register exit opcode handler
-- **MSHUTDOWN**: Destroy hash tables
-- **RINIT/RSHUTDOWN**: Per-request setup/cleanup (minimal)
+### Module lifecycle
 
-### PHP API
-
-```php
-trapbox_intercept(string $function, Closure $handler)
-// Handler: function($original, ...$args) { return $original(...$args); }
-
-trapbox_set_exit_handler(Closure $handler)
-// Handler: function($status) { /* handle exit */ }
-// PHP < 8.4: Handler called, then script stops (opcode limitation)
-// PHP 8.4+: Handler called, script continues (exit is a function)
-
-trapbox_seal()
-// Removes trapbox_intercept and trapbox_seal from function table
-```
-
-### PHP Version Compatibility
-
-The extension supports PHP 7.4 through 8.5. Version-conditional compilation is used via `#if PHP_VERSION_ID` guards:
-- **PHP < 8.4**: `exit` is an opcode — intercepted via `zend_set_user_opcode_handler(ZEND_EXIT, ...)`
-- **PHP >= 8.4**: `exit` is a regular function — intercepted via the same `trapbox_intercept` mechanism
-
-### Key Constraints
-
-- `trapbox_intercept` cannot intercept itself (explicitly blocked)
-- A function can only be intercepted once (re-interception returns a warning)
-- After `trapbox_seal()`, no further interceptions are possible
-- `__thread` is used for `internal_call_context` — the extension assumes thread-local storage support
-
-### Source Files
-
-All extension logic is in `trapbox.c` (single file). `php_trapbox.h` only contains the module entry extern and version define.
-
-### Stealth Features
-
-- `phpinfo()` output is empty (MINFO callback is NULL in module entry)
-- Module version is NULL in module entry
-- `seal()` removes trapbox functions from PHP's function table
+- **MINIT**: Register ini settings, swap compile hooks
+- **MSHUTDOWN**: Restore compile hooks
+- **RINIT**: Generate correlation ID, initialize per-request state
+- **RSHUTDOWN**: Restore function table, clean up per-request state

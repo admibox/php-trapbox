@@ -417,6 +417,76 @@ ZEND_FUNCTION(trapbox_exec_handler)
   RETURN_FALSE;
 }
 
+/* ── eval interception (zend_compile_string) ──────────────────── */
+
+#if PHP_VERSION_ID >= 80200
+typedef zend_op_array *(*trapbox_compile_string_t)(zend_string *source, const char *filename, zend_compile_position position);
+#elif PHP_VERSION_ID >= 80000
+typedef zend_op_array *(*trapbox_compile_string_t)(zend_string *source, const char *filename);
+#else
+typedef zend_op_array *(*trapbox_compile_string_t)(zval *source, char *filename);
+#endif
+
+static trapbox_compile_string_t trapbox_prev_compile_string = NULL;
+
+/* Logs the eval and returns the mode. The filename names the construct: eval()'d code, assert code, runtime-created function */
+static enum trapbox_mode trapbox_eval_mode(const char *source, size_t source_len, const char *filename)
+{
+  enum trapbox_mode mode = trapbox_parse_mode(TRAPBOX_G(mode_eval));
+  const char *arg_strs[2] = { source, filename ? filename : "" };
+  size_t arg_lens[2] = { source_len, filename ? strlen(filename) : 0 };
+  trapbox_log_event("eval", trapbox_mode_name(mode), "eval", arg_strs, arg_lens, 2);
+  return mode;
+}
+
+/* block returns NULL without an exception: the engine then evaluates eval() to false, like a failed compile.
+   trap compiles `return;` instead of the payload: eval() returns null, as if the code ran and returned nothing.
+   An empty source would not do: compile_string returns NULL for it, which is block. */
+#define TRAPBOX_TRAP_SOURCE "return;"
+
+#if PHP_VERSION_ID >= 80200
+static zend_op_array *trapbox_compile_string(zend_string *source, const char *filename, zend_compile_position position)
+{
+  enum trapbox_mode mode = trapbox_eval_mode(ZSTR_VAL(source), ZSTR_LEN(source), filename);
+  if (mode == TRAPBOX_MODE_BLOCK) return NULL;
+  if (mode == TRAPBOX_MODE_TRAP) {
+    zend_string *trap = zend_string_init(TRAPBOX_TRAP_SOURCE, sizeof(TRAPBOX_TRAP_SOURCE) - 1, 0);
+    zend_op_array *op_array = trapbox_prev_compile_string(trap, filename, position);
+    zend_string_release(trap);
+    return op_array;
+  }
+  return trapbox_prev_compile_string(source, filename, position);
+}
+#elif PHP_VERSION_ID >= 80000
+static zend_op_array *trapbox_compile_string(zend_string *source, const char *filename)
+{
+  enum trapbox_mode mode = trapbox_eval_mode(ZSTR_VAL(source), ZSTR_LEN(source), filename);
+  if (mode == TRAPBOX_MODE_BLOCK) return NULL;
+  if (mode == TRAPBOX_MODE_TRAP) {
+    zend_string *trap = zend_string_init(TRAPBOX_TRAP_SOURCE, sizeof(TRAPBOX_TRAP_SOURCE) - 1, 0);
+    zend_op_array *op_array = trapbox_prev_compile_string(trap, filename);
+    zend_string_release(trap);
+    return op_array;
+  }
+  return trapbox_prev_compile_string(source, filename);
+}
+#else
+static zend_op_array *trapbox_compile_string(zval *source, char *filename)
+{
+  if (Z_TYPE_P(source) != IS_STRING) return trapbox_prev_compile_string(source, filename);
+  enum trapbox_mode mode = trapbox_eval_mode(Z_STRVAL_P(source), Z_STRLEN_P(source), filename);
+  if (mode == TRAPBOX_MODE_BLOCK) return NULL;
+  if (mode == TRAPBOX_MODE_TRAP) {
+    zval trap;
+    ZVAL_STRINGL(&trap, TRAPBOX_TRAP_SOURCE, sizeof(TRAPBOX_TRAP_SOURCE) - 1);
+    zend_op_array *op_array = trapbox_prev_compile_string(&trap, filename);
+    zval_ptr_dtor(&trap);
+    return op_array;
+  }
+  return trapbox_prev_compile_string(source, filename);
+}
+#endif
+
 static void trapbox_install_hooks(trapbox_hook *hooks, zif_handler handler)
 {
   for (trapbox_hook *hook = hooks; hook->name; hook++) {
@@ -450,11 +520,18 @@ PHP_MINIT_FUNCTION(trapbox)
   if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
     trapbox_install_hooks(trapbox_exec_hooks, ZEND_FN(trapbox_exec_handler));
   }
+  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_eval)) != TRAPBOX_MODE_OFF) {
+    trapbox_prev_compile_string = zend_compile_string;
+    zend_compile_string = trapbox_compile_string;
+  }
   return SUCCESS;
 }
 
 PHP_MSHUTDOWN_FUNCTION(trapbox)
 {
+  if (zend_compile_string == trapbox_compile_string) {
+    zend_compile_string = trapbox_prev_compile_string;
+  }
   UNREGISTER_INI_ENTRIES();
   return SUCCESS;
 }

@@ -32,6 +32,8 @@ Tests use `sudo nerdctl` (not docker). `test-versions.sh` auto-detects the conta
 
 `test.php` is the runner — it includes all `test_*.php` files. Each test prints `OK:` or `FAIL:` lines. Add new tests as `test_<name>.php`.
 
+`e2e/request_check.php` drives a real HTTP request through `php -S`, because CLI has no request context. Never put PHP files in `tests/`: `phpize --clean` deletes `tests/*.php`.
+
 ## Architecture
 
 Single source file: `trapbox.c`. Header: `php_trapbox.h`.
@@ -47,9 +49,14 @@ Single source file: `trapbox.c`. Header: `php_trapbox.h`.
 | unserialize | Function table replacement |
 | Errors/warnings | `zend_error_cb` (7.x) / `zend_register_error_notify_callback` (8.0+) |
 
+### Current limitations
+
+- All modes default to `bypass`: installing the extension must not change application behavior.
+- `trapbox.exec = trap` currently behaves like `block` (returns `false`). Fake output is pending, see the open questions in the design plan.
+
 ### Version compatibility
 
-PHP 7.4 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` for:
+PHP 7.3 through 8.5. Version-conditional compilation via `#if PHP_VERSION_ID` for:
 - `zend_compile_string` signature (changes at 8.0 and 8.2)
 - `zend_error_cb` vs `zend_register_error_notify_callback` (changes at 8.0)
 

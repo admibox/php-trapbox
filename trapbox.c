@@ -23,7 +23,7 @@
 PHP_INI_BEGIN()
   STD_PHP_INI_BOOLEAN("trapbox.enabled", "1", PHP_INI_SYSTEM, OnUpdateBool, enabled, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.log_path", "/var/log/trapbox/events.jsonl", PHP_INI_SYSTEM, OnUpdateString, log_path, zend_trapbox_globals, trapbox_globals)
-  STD_PHP_INI_ENTRY("trapbox.exec", "block", PHP_INI_SYSTEM, OnUpdateString, mode_exec, zend_trapbox_globals, trapbox_globals)
+  STD_PHP_INI_ENTRY("trapbox.exec", "bypass", PHP_INI_SYSTEM, OnUpdateString, mode_exec, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.eval", "bypass", PHP_INI_SYSTEM, OnUpdateString, mode_eval, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.include", "bypass", PHP_INI_SYSTEM, OnUpdateString, mode_include, zend_trapbox_globals, trapbox_globals)
   STD_PHP_INI_ENTRY("trapbox.file_write", "bypass", PHP_INI_SYSTEM, OnUpdateString, mode_file_write, zend_trapbox_globals, trapbox_globals)
@@ -57,12 +57,31 @@ enum trapbox_mode {
 
 static enum trapbox_mode trapbox_parse_mode(const char *str)
 {
-  if (!str) return TRAPBOX_MODE_OFF;
+  /* The ini parser turns an unquoted `off` into an empty string */
+  if (!str || !*str || strcmp(str, "off") == 0) return TRAPBOX_MODE_OFF;
   if (strcmp(str, "bypass") == 0) return TRAPBOX_MODE_BYPASS;
   if (strcmp(str, "block") == 0) return TRAPBOX_MODE_BLOCK;
   if (strcmp(str, "trap") == 0) return TRAPBOX_MODE_TRAP;
-  if (strcmp(str, "off") == 0) return TRAPBOX_MODE_OFF;
-  return TRAPBOX_MODE_OFF;
+  /* A typo must not silently disable monitoring */
+  return TRAPBOX_MODE_BYPASS;
+}
+
+static const char *trapbox_mode_name(enum trapbox_mode mode)
+{
+  switch (mode) {
+    case TRAPBOX_MODE_BYPASS: return "bypass";
+    case TRAPBOX_MODE_BLOCK: return "block";
+    case TRAPBOX_MODE_TRAP: return "trap";
+    default: return "off";
+  }
+}
+
+static void trapbox_check_mode(const char *setting, const char *value)
+{
+  if (value && *value && strcmp(value, "off") != 0 && strcmp(value, "bypass") != 0
+      && strcmp(value, "block") != 0 && strcmp(value, "trap") != 0) {
+    zend_error(E_WARNING, "trapbox: invalid value '%s' for %s, using bypass", value, setting);
+  }
 }
 
 /* ── correlation id ───────────────────────────────────────────── */
@@ -101,7 +120,8 @@ static void trapbox_json_append_escaped(smart_str *buf, const char *str, size_t 
       case '\r': smart_str_appendl(buf, "\\r", 2); break;
       case '\t': smart_str_appendl(buf, "\\t", 2); break;
       default:
-        if (c < 0x20) {
+        /* Bytes >= 0x80 map to U+00XX so binary payloads stay valid JSON and recoverable */
+        if (c < 0x20 || c >= 0x7f) {
           char esc[7];
           snprintf(esc, sizeof(esc), "\\u%04x", c);
           smart_str_appendl(buf, esc, 6);
@@ -149,13 +169,9 @@ static void trapbox_capture_request(void)
 
   TRAPBOX_G(server_ht) = Z_ARRVAL_P(server);
 
-  /* Client IP: CF-Connecting-IP > X-Forwarded-For > REMOTE_ADDR */
+  /* Forwarding headers are attacker-controlled, so they are logged as headers, never as the ip */
   zval *val;
-  if ((val = zend_hash_str_find(TRAPBOX_G(server_ht), "HTTP_CF_CONNECTING_IP", sizeof("HTTP_CF_CONNECTING_IP") - 1)) && Z_TYPE_P(val) == IS_STRING) {
-    TRAPBOX_G(client_ip) = Z_STRVAL_P(val);
-  } else if ((val = zend_hash_str_find(TRAPBOX_G(server_ht), "HTTP_X_FORWARDED_FOR", sizeof("HTTP_X_FORWARDED_FOR") - 1)) && Z_TYPE_P(val) == IS_STRING) {
-    TRAPBOX_G(client_ip) = Z_STRVAL_P(val);
-  } else if ((val = zend_hash_str_find(TRAPBOX_G(server_ht), "REMOTE_ADDR", sizeof("REMOTE_ADDR") - 1)) && Z_TYPE_P(val) == IS_STRING) {
+  if ((val = zend_hash_str_find(TRAPBOX_G(server_ht), "REMOTE_ADDR", sizeof("REMOTE_ADDR") - 1)) && Z_TYPE_P(val) == IS_STRING) {
     TRAPBOX_G(client_ip) = Z_STRVAL_P(val);
   }
 
@@ -209,6 +225,46 @@ static void trapbox_append_backtrace(smart_str *buf)
 
 /* ── event writer ─────────────────────────────────────────────── */
 
+static void trapbox_request_field(smart_str *buf, int *first, const char *key, const char *val, size_t len, size_t max_len)
+{
+  if (!*first) smart_str_appendc(buf, ',');
+  *first = 0;
+  trapbox_json_key_str(buf, key, val, len, max_len);
+}
+
+static void trapbox_append_headers(smart_str *buf, int *first)
+{
+  zend_string *key;
+  zval *val;
+  int first_header = 1;
+
+  if (!TRAPBOX_G(server_ht)) return;
+
+  if (!*first) smart_str_appendc(buf, ',');
+  *first = 0;
+  smart_str_appendl(buf, "\"headers\":{", 11);
+
+  ZEND_HASH_FOREACH_STR_KEY_VAL(TRAPBOX_G(server_ht), key, val) {
+    if (!key || ZSTR_LEN(key) <= 5 || strncmp(ZSTR_VAL(key), "HTTP_", 5) != 0 || Z_TYPE_P(val) != IS_STRING) continue;
+    /* Credentials of legitimate users do not belong in a forensic log */
+    if (strcmp(ZSTR_VAL(key), "HTTP_COOKIE") == 0 || strcmp(ZSTR_VAL(key), "HTTP_AUTHORIZATION") == 0) continue;
+
+    if (!first_header) smart_str_appendc(buf, ',');
+    first_header = 0;
+
+    smart_str_appendc(buf, '"');
+    for (size_t i = 5; i < ZSTR_LEN(key); i++) {
+      char c = ZSTR_VAL(key)[i];
+      smart_str_appendc(buf, c == '_' ? '-' : (char)tolower((unsigned char)c));
+    }
+    smart_str_appendl(buf, "\":\"", 3);
+    trapbox_json_append_escaped(buf, Z_STRVAL_P(val), Z_STRLEN_P(val), TRAPBOX_G(max_arg_size));
+    smart_str_appendc(buf, '"');
+  } ZEND_HASH_FOREACH_END();
+
+  smart_str_appendc(buf, '}');
+}
+
 void trapbox_log_event(const char *category, const char *mode, const char *function,
                        const char *const *arg_strs, const size_t *arg_lens, int arg_count)
 {
@@ -257,20 +313,19 @@ void trapbox_log_event(const char *category, const char *mode, const char *funct
 
   /* request */
   smart_str_appendl(&buf, "\"request\":{", 11);
+  int first_field = 1;
   if (TRAPBOX_G(request_method)) {
-    trapbox_json_key_str(&buf, "method", TRAPBOX_G(request_method), strlen(TRAPBOX_G(request_method)), 0);
-    smart_str_appendc(&buf, ',');
+    trapbox_request_field(&buf, &first_field, "method", TRAPBOX_G(request_method), strlen(TRAPBOX_G(request_method)), 0);
   }
   if (TRAPBOX_G(request_uri)) {
-    trapbox_json_key_str(&buf, "uri", TRAPBOX_G(request_uri), strlen(TRAPBOX_G(request_uri)), 0);
-    smart_str_appendc(&buf, ',');
+    trapbox_request_field(&buf, &first_field, "uri", TRAPBOX_G(request_uri), strlen(TRAPBOX_G(request_uri)), 0);
   }
   if (TRAPBOX_G(client_ip)) {
-    trapbox_json_key_str(&buf, "ip", TRAPBOX_G(client_ip), strlen(TRAPBOX_G(client_ip)), 0);
+    trapbox_request_field(&buf, &first_field, "ip", TRAPBOX_G(client_ip), strlen(TRAPBOX_G(client_ip)), 0);
   }
+  trapbox_append_headers(&buf, &first_field);
   if (TRAPBOX_G(request_body)) {
-    smart_str_appendc(&buf, ',');
-    trapbox_json_key_str(&buf, "body", ZSTR_VAL(TRAPBOX_G(request_body)), ZSTR_LEN(TRAPBOX_G(request_body)), TRAPBOX_G(max_body_size));
+    trapbox_request_field(&buf, &first_field, "body", ZSTR_VAL(TRAPBOX_G(request_body)), ZSTR_LEN(TRAPBOX_G(request_body)), TRAPBOX_G(max_body_size));
   }
   smart_str_appendl(&buf, "},", 2);
 
@@ -293,6 +348,128 @@ void trapbox_log_event(const char *category, const char *mode, const char *funct
   smart_str_free(&buf);
 }
 
+/* ── function table interception ──────────────────────────────── */
+
+typedef struct _trapbox_intercepted {
+  zend_function func;
+  zend_function *original;
+} trapbox_intercepted;
+
+#define TRAPBOX_MAX_INTERCEPTS 32
+
+static const char *trapbox_exec_functions[] = {
+  "exec", "system", "shell_exec", "passthru",
+  "popen", "proc_open", "pcntl_exec", NULL
+};
+
+static zend_string *trapbox_zstr_arg(zval *arg)
+{
+  if (Z_TYPE_P(arg) == IS_STRING) {
+    return Z_STR_P(arg);
+  }
+  return NULL;
+}
+
+ZEND_FUNCTION(trapbox_exec_handler)
+{
+  enum trapbox_mode mode = trapbox_parse_mode(TRAPBOX_G(mode_exec));
+  if (mode == TRAPBOX_MODE_OFF) {
+    /* Call original directly */
+    trapbox_intercepted *ti = (trapbox_intercepted *)execute_data->func;
+    zend_function *orig = ti->original;
+    execute_data->func = orig;
+    orig->internal_function.handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    return;
+  }
+
+  trapbox_intercepted *ti = (trapbox_intercepted *)execute_data->func;
+  zend_function *orig = ti->original;
+  const char *fn_name = ZSTR_VAL(orig->common.function_name);
+
+  /* Collect first argument as the command string for logging */
+  const char *arg_strs[1] = { "" };
+  size_t arg_lens[1] = { 0 };
+  int arg_count = 0;
+
+  uint32_t num_args = ZEND_NUM_ARGS();
+  if (num_args > 0) {
+    zval *args = safe_emalloc(num_args, sizeof(zval), 0);
+    if (zend_get_parameters_array_ex(num_args, args) == SUCCESS) {
+      zend_string *cmd = trapbox_zstr_arg(&args[0]);
+      if (cmd) {
+        arg_strs[0] = ZSTR_VAL(cmd);
+        arg_lens[0] = ZSTR_LEN(cmd);
+        arg_count = 1;
+      }
+    }
+    efree(args);
+  }
+
+  trapbox_log_event("exec", trapbox_mode_name(mode), fn_name, arg_strs, arg_lens, arg_count);
+
+  if (mode == TRAPBOX_MODE_BYPASS) {
+    execute_data->func = orig;
+    orig->internal_function.handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    return;
+  }
+
+  /* block or trap: return false */
+  RETURN_FALSE;
+}
+
+static int trapbox_intercept_function(const char *name, zif_handler handler)
+{
+  zend_string *zname = zend_string_init(name, strlen(name), 0);
+  zval *entry = zend_hash_find(EG(function_table), zname);
+  zend_string_release(zname);
+
+  if (!entry) return FAILURE;
+
+  zend_function *orig = Z_PTR_P(entry);
+
+  trapbox_intercepted *ti = emalloc(sizeof(trapbox_intercepted));
+  zend_function *orig_copy = emalloc(sizeof(zend_function));
+  memcpy(orig_copy, orig, sizeof(zend_function));
+  ti->original = orig_copy;
+
+  memcpy(&ti->func, orig, sizeof(zend_function));
+  ti->func.internal_function.handler = handler;
+
+  /* Store in per-request tracking array */
+  int idx = TRAPBOX_G(intercept_count);
+  if (idx >= TRAPBOX_MAX_INTERCEPTS) {
+    efree(orig_copy);
+    efree(ti);
+    return FAILURE;
+  }
+  TRAPBOX_G(intercepts)[idx] = ti;
+  TRAPBOX_G(originals)[idx] = orig;
+  TRAPBOX_G(intercept_count) = idx + 1;
+
+  /* Overwrite pointer in function table */
+  Z_PTR_P(entry) = ti;
+  return SUCCESS;
+}
+
+static void trapbox_restore_all(void)
+{
+  for (int i = 0; i < TRAPBOX_G(intercept_count); i++) {
+    trapbox_intercepted *ti = TRAPBOX_G(intercepts)[i];
+    zend_function *orig = TRAPBOX_G(originals)[i];
+
+    if (ti && orig) {
+      zend_string *name = orig->common.function_name;
+      zval *entry = zend_hash_find(EG(function_table), name);
+      if (entry && Z_PTR_P(entry) == ti) {
+        Z_PTR_P(entry) = orig;
+      }
+      efree(ti->original);
+      efree(ti);
+    }
+  }
+  TRAPBOX_G(intercept_count) = 0;
+}
+
 /* ── module lifecycle ─────────────────────────────────────────── */
 
 static const zend_function_entry trapbox_functions[] = {
@@ -303,6 +480,13 @@ PHP_MINIT_FUNCTION(trapbox)
 {
   ZEND_INIT_MODULE_GLOBALS(trapbox, php_trapbox_init_globals, NULL);
   REGISTER_INI_ENTRIES();
+  trapbox_check_mode("trapbox.exec", TRAPBOX_G(mode_exec));
+  trapbox_check_mode("trapbox.eval", TRAPBOX_G(mode_eval));
+  trapbox_check_mode("trapbox.include", TRAPBOX_G(mode_include));
+  trapbox_check_mode("trapbox.file_write", TRAPBOX_G(mode_file_write));
+  trapbox_check_mode("trapbox.secret_read", TRAPBOX_G(mode_secret_read));
+  trapbox_check_mode("trapbox.unserialize", TRAPBOX_G(mode_unserialize));
+  trapbox_check_mode("trapbox.errors", TRAPBOX_G(mode_errors));
   return SUCCESS;
 }
 
@@ -324,11 +508,22 @@ PHP_RINIT_FUNCTION(trapbox)
   TRAPBOX_G(client_ip) = NULL;
   TRAPBOX_G(server_ht) = NULL;
   TRAPBOX_G(request_body) = NULL;
+  TRAPBOX_G(intercept_count) = 0;
+
+  /* Intercept exec family */
+  if (TRAPBOX_G(enabled) && trapbox_parse_mode(TRAPBOX_G(mode_exec)) != TRAPBOX_MODE_OFF) {
+    for (const char **fn = trapbox_exec_functions; *fn; fn++) {
+      trapbox_intercept_function(*fn, ZEND_FN(trapbox_exec_handler));
+    }
+  }
+
   return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(trapbox)
 {
+  trapbox_restore_all();
+
   if (TRAPBOX_G(request_body)) {
     zend_string_release(TRAPBOX_G(request_body));
     TRAPBOX_G(request_body) = NULL;

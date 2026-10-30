@@ -24,7 +24,7 @@ else
 fi
 echo "Using container runtime: $RUNTIME"
 
-VERSIONS=("7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
+VERSIONS=("7.3" "7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAILED=()
 PASSED=()
@@ -45,18 +45,28 @@ rm -f "$SCRIPT_DIR/trapbox.dep" 2>/dev/null
 for VERSION in "${VERSIONS[@]}"; do
     echo -e "\n${YELLOW}Testing PHP $VERSION...${NC}"
 
-    if $RUNTIME run --rm -v "$SCRIPT_DIR:/ext" -w /ext "php:$VERSION-cli" sh -c '
+    if OUTPUT=$($RUNTIME run --rm -v "$SCRIPT_DIR:/ext" -w /ext "php:$VERSION-cli" sh -c '
         make clean >/dev/null 2>&1
         phpize --clean >/dev/null 2>&1
         phpize >/dev/null 2>&1 && \
         ./configure >/dev/null 2>&1 && \
-        make >/dev/null 2>&1 && \
-        php -dextension=modules/trapbox.so test.php >/dev/null 2>&1
-    ' 2>/dev/null; then
+        make >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+        LOG=/tmp/trapbox-test.jsonl
+        php -dextension=modules/trapbox.so -dtrapbox.log_path=$LOG test.php 2>&1 || exit 1
+        for MODE in off block trap; do
+            RESULT=$(php -dextension=modules/trapbox.so -dtrapbox.log_path=$LOG -dtrapbox.exec=$MODE test_exec.php 2>&1)
+            CODE=$?
+            echo "$RESULT"
+            [ $CODE -eq 0 ] || { echo "FAIL: exit code $CODE in mode $MODE"; exit 1; }
+            case "$RESULT" in *FAIL*) exit 1;; esac
+        done
+        php e2e/request_check.php 2>&1 || exit 1
+    ' 2>&1); then
         echo -e "${GREEN}PHP $VERSION: PASSED${NC}"
         PASSED+=("$VERSION")
     else
         echo -e "${RED}PHP $VERSION: FAILED${NC}"
+        echo "$OUTPUT" | tail -25
         FAILED+=("$VERSION")
     fi
 

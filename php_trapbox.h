@@ -33,6 +33,11 @@ ZEND_BEGIN_MODULE_GLOBALS(trapbox)
   const char *client_ip;
   HashTable *server_ht;
   zend_string *request_body;
+
+  /* function table intercepts (per-request) */
+  void *intercepts[32];
+  void *originals[32];
+  int intercept_count;
 ZEND_END_MODULE_GLOBALS(trapbox)
 
 ZEND_EXTERN_MODULE_GLOBALS(trapbox)

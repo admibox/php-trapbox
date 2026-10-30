@@ -10,7 +10,7 @@ $ok = true;
 
 // Verify all mode defaults
 $modes = [
-    'trapbox.exec' => 'block',
+    'trapbox.exec' => 'bypass',
     'trapbox.eval' => 'bypass',
     'trapbox.include' => 'bypass',
     'trapbox.file_write' => 'bypass',

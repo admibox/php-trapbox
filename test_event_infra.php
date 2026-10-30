@@ -6,7 +6,7 @@ $ok = true;
 // Check ini defaults are registered
 $checks = [
     'trapbox.enabled' => '1',
-    'trapbox.exec' => 'block',
+    'trapbox.exec' => 'bypass',
     'trapbox.eval' => 'bypass',
     'trapbox.file_write_extensions' => 'php,phtml,inc,htaccess,user.ini,js,html',
     'trapbox.max_arg_size' => '65536',

@@ -87,7 +87,8 @@ not a general leak-free guarantee. Allocator-disabled cleanup is tested
 separately under Valgrind.
 The ZTS runners use official PHP 7.3/7.4 ZTS images. The embedded harness runs
 eight actual interpreter threads; `--cold` tests concurrent first requests.
-See `HANDOFF.md` for evidence, exact gates and remaining limitations.
+See [VALIDATION.md](VALIDATION.md) for validation evidence and exact gates.
+Remaining interception limitations are documented below.
 
 ## Architecture
 

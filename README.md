@@ -18,7 +18,7 @@ trapbox uses the engine's error observer. `trapbox.errors=off` disables error
 observation; `trapbox.enabled=0` disables trapbox. No separate build flag or
 runtime setting is needed for the PHP 7 wrapper.
 
-Settings are `PHP_INI_SYSTEM`: restart PHP-FPM after changing them. PHP scripts
+Settings are `PHP_INI_SYSTEM`: reload or restart PHP-FPM after changing them. PHP scripts
 cannot change them with `ini_set()`. Errors are only observed, including when
 the configured error mode is `block` or `trap`.
 
@@ -29,5 +29,6 @@ cases have no additional lost bytes or blocks compared with native PHP under
 Valgrind, including with `USE_ZEND_ALLOC=0`; native PHP itself still has losses
 in that configuration. This is not a general leak-free guarantee.
 
-See [CLAUDE.md](CLAUDE.md) for build/test commands and [HANDOFF.md](HANDOFF.md)
-for validation evidence and outstanding work.
+See [CLAUDE.md](CLAUDE.md) for build/test commands and known limitations.
+See [VALIDATION.md](VALIDATION.md) for the PHP matrix, memory and concurrency
+checks, and local Magento deployment and browser validation results.
